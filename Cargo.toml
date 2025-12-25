@@ -1,0 +1,23 @@
+[package]
+name = "SkyRoam"
+version = "0.0.1-demo"
+edition = "2025"
+
+[dependencies]
+winit = "0.29"
+wgpu = "0.19"
+pollster = "0.3"
+glam = "0.25"
+bytemuck = { version = "1.14", features = ["derive"] }
+rand = "0.8"
+env_logger = "0.11.8"
+log = "0.4.29"
+
+
+[profile.release]
+opt-level = 3 # max optimization lim
+lto = "fat" # specific optimizations across all crates
+codegen-units = 1 # compile everything as one unit, slower build, but enables better optimization.
+panic = "abort" # removes panic unwinding logic, smaller binary, slightly faster, but you can't catch panics.
+strip = true # strips symbols (debug info) from the binary, drastically reduces file size.
+debug = false # ensure no debug info is left.
