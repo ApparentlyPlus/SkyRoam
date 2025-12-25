@@ -1,27 +1,17 @@
-// This is the WGSL shader source code used for rendering.
-// I embedded it here as a raw string cuz its cooler and doesn't need external files, yippie
-
-pub const SOURCE: &str = r#"
-
+// SCENE SHADER (Directional Light + Black Sky)
+pub const SCENE_SHADER: &str = r#"
 struct CameraUniform {
     view_proj: mat4x4<f32>,
     screen_size: vec2<f32>,
-    fog_dist: vec2<f32>, // x = fog_start, y = fog_end
+    fog_dist: vec2<f32>,
     camera_pos: vec4<f32>,
 };
-
-@group(0) @binding(0)
-var<uniform> camera: CameraUniform;
+@group(0) @binding(0) var<uniform> camera: CameraUniform;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
-};
-
-struct InstanceInput {
-    @location(5) pos: vec3<f32>,
-    @location(6) scale: vec3<f32>,
-    @location(7) color_val: f32, 
+    @location(2) color: vec3<f32>,
 };
 
 struct VertexOutput {
@@ -32,47 +22,72 @@ struct VertexOutput {
 };
 
 @vertex
-fn vs_main(model: VertexInput, instance: InstanceInput) -> VertexOutput {
-    let scaled_pos = model.position * instance.scale;
-    let world_pos_vec3 = scaled_pos + instance.pos;
-    
+fn vs_main(model: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.clip_position = camera.view_proj * vec4<f32>(world_pos_vec3, 1.0);
-    out.world_pos = world_pos_vec3;
-    out.color = vec3<f32>(instance.color_val, instance.color_val, instance.color_val);
+    out.world_pos = model.position;
+    out.clip_position = camera.view_proj * vec4<f32>(model.position, 1.0);
     out.normal = model.normal;
+    out.color = model.color;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // crosshair
-    let center = camera.screen_size * 0.5;
-    let screen_dist = distance(in.clip_position.xy, center);
-    if (screen_dist < 2.5) {
-        return vec4<f32>(1.0, 1.0, 1.0, 1.0);
-    }
+    // 1. DIRECTIONAL LIGHTING (Fixes "blob" look)
+    // "Sun" direction coming from top-right-front
+    let sun_dir = normalize(vec3<f32>(0.5, 1.0, 0.5));
+    let normal = normalize(in.normal);
+    
+    // Diffuse shading (Dot product)
+    // range 0.2 to 1.0 so shadows aren't pitch black
+    let diff = max(dot(normal, sun_dir), 0.0);
+    let light = 0.2 + (diff * 0.8);
 
-    // lighting for cubes
-    var brightness = 0.5;
-    let abs_norm = abs(in.normal);
-    if (abs_norm.y > 0.9) { brightness = 1.0; } 
-    else if (abs_norm.x > 0.9) { brightness = 0.6; } 
-    else if (abs_norm.z > 0.9) { brightness = 0.3; }
+    // 2. HEIGHT GRADIENT (Subtle)
+    // Darkens the base of tall buildings slightly to ground them
+    let height_gradient = clamp((in.world_pos.y + 20.0) / 150.0, 0.4, 1.0);
+    
+    // Combine base color + lighting + gradient
+    let lit_color = in.color * light * height_gradient;
 
-    // gradient for visibility
-    let height_gradient = clamp(in.world_pos.y / 150.0, 0.5, 1.0);
-    let lit_color = in.color * brightness * height_gradient;
-
-    // fog stuff
-    // Fog color is black to fade into the void
+    // 3. FOG (PURE BLACK)
     let dist = distance(in.world_pos, camera.camera_pos.xyz);
-    let fog_start = camera.fog_dist.x; 
-    let fog_end = camera.fog_dist.y; 
+    let fog_factor = smoothstep(camera.fog_dist.x, camera.fog_dist.y, dist);
+    let fog_color = vec3<f32>(0.0, 0.0, 0.0);
+
+    return vec4<f32>(mix(lit_color, fog_color, fog_factor), 1.0);
+}
+"#;
+
+// UI SHADER (Unchanged - White Dot)
+pub const UI_SHADER: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
+    var out: VertexOutput;
+    let size = 0.003; 
+    var pos = vec2<f32>(0.0, 0.0);
+    var uv = vec2<f32>(0.5, 0.5);
+
+    if (in_vertex_index == 0u) { pos = vec2<f32>(-size, -size); uv = vec2<f32>(0.0, 0.0); }
+    if (in_vertex_index == 1u) { pos = vec2<f32>( size, -size); uv = vec2<f32>(1.0, 0.0); }
+    if (in_vertex_index == 2u) { pos = vec2<f32>(-size,  size); uv = vec2<f32>(0.0, 1.0); }
+    if (in_vertex_index == 3u) { pos = vec2<f32>( size,  size); uv = vec2<f32>(1.0, 1.0); }
     
-    // Smoothstep creates a smoother transition than linear clamp
-    let fog_factor = smoothstep(fog_start, fog_end, dist);
-    
-    return vec4<f32>(mix(lit_color, vec3<f32>(0.0, 0.0, 0.0), fog_factor), 1.0);
+    out.position = vec4<f32>(pos.x, pos.y * 1.77, 0.0, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let center = vec2<f32>(0.5, 0.5);
+    let dist = distance(in.uv, center);
+    if (dist > 0.5) { discard; }
+    return vec4<f32>(1.0, 1.0, 1.0, 1.0);
 }
 "#;

@@ -1,7 +1,7 @@
 use winit::{window::Window, event::*};
 use wgpu::util::DeviceExt;
 use std::time::Instant;
-use crate::{camera::{Camera, CameraUniform, CameraController}, vertex::*, world::*, shader};
+use crate::{camera::{Camera, CameraUniform, CameraController}, world::*, shader};
 
 pub struct State {
     surface: wgpu::Surface<'static>,
@@ -9,13 +9,15 @@ pub struct State {
     queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
+    
+    // Pipelines
     render_pipeline: wgpu::RenderPipeline,
+    ui_pipeline: wgpu::RenderPipeline,
+
+    // Buffers
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
-    instance_buffer: wgpu::Buffer,
-    instance_capacity: usize,
-    num_indices: u32,           
-    num_draw_instances: u32,
+    num_indices: u32,
     
     // Components
     world: World,
@@ -32,10 +34,10 @@ pub struct State {
     // Logic
     pub mouse_captured: bool,
     last_frame_time: Instant,
+    
+    // PHYSICS
+    velocity: glam::Vec3,
     on_ground: bool,
-    scratch_instances: Vec<InstanceRaw>,
-    last_camera_pos: glam::Vec3,
-    last_camera_yaw: f32,
 }
 
 impl State {
@@ -56,41 +58,36 @@ impl State {
 
         let config = surface.get_default_config(&adapter, size.width, size.height).unwrap();
         let mut vsync_config = config.clone();
-        vsync_config.present_mode = wgpu::PresentMode::Immediate; 
+        vsync_config.present_mode = wgpu::PresentMode::AutoNoVsync; 
         surface.configure(&device, &vsync_config);
 
         // --- WORLD & BUFFERS ---
         let world = World::generate();
-        let instance_capacity = 20_000;
-        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Instance Buffer"),
-            size: (instance_capacity * std::mem::size_of::<InstanceRaw>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
+        
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"), contents: bytemuck::cast_slice(VERTICES), usage: wgpu::BufferUsages::VERTEX,
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(&world.vertices),
+            usage: wgpu::BufferUsages::VERTEX,
         });
+        
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"), contents: bytemuck::cast_slice(INDICES), usage: wgpu::BufferUsages::INDEX,
+            label: Some("Index Buffer"),
+            contents: bytemuck::cast_slice(&world.indices),
+            usage: wgpu::BufferUsages::INDEX,
         });
 
-        // --- PIPELINE ---
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Shader"), source: wgpu::ShaderSource::Wgsl(shader::SOURCE.into()),
-        });
-
-        let aspect = if vsync_config.height > 0 { vsync_config.width as f32 / vsync_config.height as f32 } else { 1.0 };
+        // --- CAMERA ---
+        let aspect = vsync_config.width as f32 / vsync_config.height as f32;
         let camera = Camera {
-            eye: (0.0, 1.8, 0.0).into(), velocity: glam::Vec3::ZERO,
+            eye: (0.0, 50.0, 0.0).into(),
+            velocity: glam::Vec3::ZERO,
             yaw: -90.0f32.to_radians(), pitch: 0.0, aspect,
         };
         
         let mut camera_uniform = CameraUniform { 
             view_proj: [[0.0; 4]; 4], 
             screen_size: [vsync_config.width as f32, vsync_config.height as f32], 
-            fog_dist: [RENDER_DISTANCE_WORLD * 0.5, RENDER_DISTANCE_WORLD * 0.95],
+            fog_dist: [100.0, 2500.0],
             camera_pos: [camera.eye.x, camera.eye.y, camera.eye.z, 0.0],
         };
         camera_uniform.view_proj = camera.build_view_projection_matrix().to_cols_array_2d();
@@ -109,35 +106,59 @@ impl State {
             layout: &camera_bind_group_layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: camera_buffer.as_entire_binding() }], label: None,
         });
 
+        // --- PIPELINES ---
+        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Shader"), source: wgpu::ShaderSource::Wgsl(shader::SCENE_SHADER.into()),
+        });
+
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None, bind_group_layouts: &[&camera_bind_group_layout], push_constant_ranges: &[],
         });
 
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: None, layout: Some(&render_pipeline_layout),
+            label: Some("Render Pipeline"), layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader, entry_point: "vs_main",
-                buffers: &[
-                    wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress, step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &[wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x3 }, wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x3 }],
-                    },
-                    wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress, step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &[
-                            wgpu::VertexAttribute { offset: 0, shader_location: 5, format: wgpu::VertexFormat::Float32x3 }, 
-                            wgpu::VertexAttribute { offset: 12, shader_location: 6, format: wgpu::VertexFormat::Float32x3 }, 
-                            wgpu::VertexAttribute { offset: 24, shader_location: 7, format: wgpu::VertexFormat::Float32 }
-                        ],
-                    }
-                ],
+                module: &shader_module, entry_point: "vs_main",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<WorldVertex>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute { offset: 0,  shader_location: 0, format: wgpu::VertexFormat::Float32x3 }, // Position
+                        wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x3 }, // Normal
+                        wgpu::VertexAttribute { offset: 24, shader_location: 2, format: wgpu::VertexFormat::Float32x3 }, // Color
+                    ],
+                }],
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader, entry_point: "fs_main",
+                module: &shader_module, entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState { format: vsync_config.format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })],
             }),
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: Some(wgpu::Face::Back), ..Default::default() },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
             depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::Less, stencil: wgpu::StencilState::default(), bias: wgpu::DepthBiasState::default() }),
+            multisample: wgpu::MultisampleState { count: 4, mask: !0, alpha_to_coverage_enabled: false },
+            multiview: None,
+        });
+
+        // UI Shader (Crosshair)
+        let ui_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("UI Shader"), source: wgpu::ShaderSource::Wgsl(shader::UI_SHADER.into()),
+        });
+
+        let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("UI Pipeline"), layout: None,
+            vertex: wgpu::VertexState { module: &ui_shader_module, entry_point: "vs_main", buffers: &[] },
+            fragment: Some(wgpu::FragmentState {
+                module: &ui_shader_module, entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState { format: vsync_config.format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState { count: 4, mask: !0, alpha_to_coverage_enabled: false },
             multiview: None,
         });
@@ -147,14 +168,14 @@ impl State {
 
         Self {
             surface, device, queue, config: vsync_config, size,
-            render_pipeline, vertex_buffer, index_buffer, instance_buffer, instance_capacity,
-            num_indices: INDICES.len() as u32, num_draw_instances: 0,
+            render_pipeline, ui_pipeline, vertex_buffer, index_buffer,
+            num_indices: world.indices.len() as u32,
             world, camera, camera_controller: CameraController::new(),
             camera_uniform, camera_buffer, camera_bind_group,
             depth_texture, msaa_texture,
-            mouse_captured: false, last_frame_time: Instant::now(), on_ground: false,
-            scratch_instances: Vec::with_capacity(50000),
-            last_camera_pos: glam::Vec3::ZERO, last_camera_yaw: 0.0,
+            mouse_captured: false, last_frame_time: Instant::now(),
+            velocity: glam::Vec3::ZERO,
+            on_ground: false,
         }
     }
 
@@ -163,7 +184,7 @@ impl State {
         let desc = wgpu::TextureDescriptor {
             label: Some("Depth Texture"), size, mip_level_count: 1, sample_count: 4,
             dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
         };
         device.create_texture(&desc).create_view(&wgpu::TextureViewDescriptor::default())
     }
@@ -204,22 +225,58 @@ impl State {
         }
     }
 
-    fn check_collision(&self, new_pos: glam::Vec3) -> bool {
-        let player_radius = 0.5;
-        let gx = (new_pos.x / 25.0).round() as i32; // Hardcoded spread match
-        let gz = (new_pos.z / 25.0).round() as i32;
+    // UPDATED: Now returns Option<Normal Vector>
+    // This allows us to calculate sliding direction
+    fn check_collision(&self, new_pos: glam::Vec3) -> Option<glam::Vec3> {
+        let player_radius = 0.3; // Tighter radius to avoid phantom hits
+        let wall_thickness = 0.1;
+        let collision_dist = player_radius + wall_thickness;
+        let collision_dist_sq = collision_dist * collision_dist;
+
+        let gx = (new_pos.x / 50.0).floor() as i32;
+        let gz = (new_pos.z / 50.0).floor() as i32;
         
         for ox in -1..=1 {
             for oz in -1..=1 {
-                if let Some(bbox) = self.world.collision_map.get(&(gx + ox, gz + oz)) {
-                    if new_pos.x + player_radius > bbox.min.x && new_pos.x - player_radius < bbox.max.x &&
-                       new_pos.z + player_radius > bbox.min.z && new_pos.z - player_radius < bbox.max.z {
-                        return true;
+                if let Some(walls) = self.world.collision_map.get(&(gx + ox, gz + oz)) {
+                    for wall in walls {
+                        if new_pos.y > wall.height { continue; }
+                        
+                        // AABB Rejection
+                        if new_pos.x < wall.min_x - collision_dist ||
+                           new_pos.x > wall.max_x + collision_dist ||
+                           new_pos.z < wall.min_z - collision_dist ||
+                           new_pos.z > wall.max_z + collision_dist {
+                            continue;
+                        }
+
+                        // Distance to Line Segment
+                        let p = glam::Vec2::new(new_pos.x, new_pos.z);
+                        let a = wall.start;
+                        let b = wall.end;
+                        
+                        let ab = b - a;
+                        let ap = p - a;
+                        
+                        let t = (ap.dot(ab) / ab.length_squared()).clamp(0.0, 1.0);
+                        let closest = a + ab * t;
+                        
+                        if p.distance_squared(closest) < collision_dist_sq {
+                            // Calculate Normal to slide against
+                            let push_vec = p - closest;
+                            if push_vec.length_squared() > 0.00001 {
+                                let normal_2d = push_vec.normalize();
+                                return Some(glam::Vec3::new(normal_2d.x, 0.0, normal_2d.y));
+                            } else {
+                                // Fallback normal if exactly inside
+                                return Some(glam::Vec3::new(1.0, 0.0, 0.0));
+                            }
+                        }
                     }
                 }
             }
         }
-        false
+        None
     }
 
     pub fn update(&mut self) {
@@ -227,121 +284,90 @@ impl State {
         let dt = now.duration_since(self.last_frame_time).as_secs_f32().clamp(0.0001, 0.1);
         self.last_frame_time = now;
 
-        let speed = 8.5; 
-        let gravity = 20.0; 
-        let jump_force = 8.0; 
-        let mut camera_moved = false; 
+        let move_speed = 10.0; 
+        let gravity = 35.0; 
+        let jump_force = 12.0;
 
-        if self.mouse_captured {
-            if self.last_camera_yaw != self.camera.yaw {
-                camera_moved = true;
-                self.last_camera_yaw = self.camera.yaw;
-            }
+        let (sin_yaw, cos_yaw) = self.camera.yaw.sin_cos();
+        let forward = glam::Vec3::new(cos_yaw, 0.0, sin_yaw).normalize();
+        let right = glam::Vec3::new(-sin_yaw, 0.0, cos_yaw).normalize();
 
-            let (sin_yaw, cos_yaw) = self.camera.yaw.sin_cos();
-            let forward = glam::Vec3::new(cos_yaw, 0.0, sin_yaw).normalize();
-            let right = glam::Vec3::new(-sin_yaw, 0.0, cos_yaw).normalize();
+        let mut input_dir = glam::Vec3::ZERO;
+        if self.camera_controller.move_fwd { input_dir += forward; }
+        if self.camera_controller.move_back { input_dir -= forward; }
+        if self.camera_controller.move_right { input_dir += right; }
+        if self.camera_controller.move_left { input_dir -= right; }
 
-            let mut move_dir = glam::Vec3::ZERO;
-            if self.camera_controller.move_fwd { move_dir += forward; }
-            if self.camera_controller.move_back { move_dir -= forward; }
-            if self.camera_controller.move_right { move_dir += right; }
-            if self.camera_controller.move_left { move_dir -= right; }
-
-            if move_dir.length_squared() > 0.0 {
-                camera_moved = true; 
-                let velocity = move_dir.normalize() * speed * dt;
-                let mut target_x = self.camera.eye; target_x.x += velocity.x;
-                let mut target_z = self.camera.eye; target_z.z += velocity.z;
-                if !self.check_collision(target_x) { self.camera.eye.x += velocity.x; }
-                if !self.check_collision(target_z) { self.camera.eye.z += velocity.z; }
-            }
-            if self.on_ground && self.camera_controller.jump {
-                self.camera.velocity.y = jump_force;
-                self.on_ground = false;
-                camera_moved = true;
-            }
+        if input_dir.length_squared() > 0.0 {
+            input_dir = input_dir.normalize();
         }
-
-        self.camera.velocity.y -= gravity * dt;
-        self.camera.eye.y += self.camera.velocity.y * dt;
         
-        if self.camera.eye.y < 1.8 { 
-            self.camera.eye.y = 1.8; 
-            self.camera.velocity.y = 0.0; 
-            self.on_ground = true; 
-        } else if self.camera.velocity.y.abs() > 0.01 {
-             camera_moved = true; 
+        self.velocity.x = input_dir.x * move_speed;
+        self.velocity.z = input_dir.z * move_speed;
+        self.velocity.y -= gravity * dt;
+
+        if self.on_ground && self.camera_controller.jump {
+            self.velocity.y = jump_force;
+            self.on_ground = false;
         }
 
-        if camera_moved {
-            self.camera_uniform.view_proj = self.camera.build_view_projection_matrix().to_cols_array_2d();
-            self.camera_uniform.camera_pos = [self.camera.eye.x, self.camera.eye.y, self.camera.eye.z, 0.0];
-            self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
+        // --- GLIDE / SLIDE PHYSICS ---
+        let mut next_pos = self.camera.eye;
+        
+        // 1. Move X
+        let next_x = next_pos + glam::Vec3::new(self.velocity.x * dt, 0.0, 0.0);
+        if let Some(normal) = self.check_collision(next_x) {
+            // SLIDE: Remove velocity component opposing the wall
+            // Project velocity onto the wall plane
+            let dot = self.velocity.dot(normal);
+            if dot < 0.0 {
+                self.velocity -= normal * dot;
+            }
+        } else {
+            next_pos.x = next_x.x;
         }
 
-        // Culling Logic
-        let dist_moved = self.camera.eye.distance_squared(self.last_camera_pos);
-        if camera_moved && (dist_moved > 0.01 || self.last_camera_yaw != self.camera.yaw) {
-            self.last_camera_pos = self.camera.eye;
-            self.scratch_instances.clear();
-            self.scratch_instances.extend_from_slice(&self.world.global_instances);
-
-            let cam_chunk_x = (self.camera.eye.x / CHUNK_SIZE).floor() as i32;
-            let cam_chunk_z = (self.camera.eye.z / CHUNK_SIZE).floor() as i32;
-            
-            let (sin_yaw, cos_yaw) = self.camera.yaw.sin_cos();
-            let cam_forward = glam::Vec2::new(cos_yaw, sin_yaw).normalize();
-            
-            for x in (cam_chunk_x - RENDER_DISTANCE_CHUNKS)..=(cam_chunk_x + RENDER_DISTANCE_CHUNKS) {
-                for z in (cam_chunk_z - RENDER_DISTANCE_CHUNKS)..=(cam_chunk_z + RENDER_DISTANCE_CHUNKS) {
-                    let dx = x - cam_chunk_x;
-                    let dz = z - cam_chunk_z;
-                    if (dx*dx + dz*dz) as f32 > (RENDER_DISTANCE_CHUNKS * RENDER_DISTANCE_CHUNKS) as f32 { continue; }
-
-                    let chunk_center_x = (x as f32 * CHUNK_SIZE) + (CHUNK_SIZE * 0.5);
-                    let chunk_center_z = (z as f32 * CHUNK_SIZE) + (CHUNK_SIZE * 0.5);
-                    let chunk_dir = glam::Vec2::new(chunk_center_x - self.camera.eye.x, chunk_center_z - self.camera.eye.z).normalize();
-                    
-                    let dist_sq = (dx * dx + dz * dz) as f32;
-                    let is_near = dist_sq < 100.0;
-
-                    let dot_prod = cam_forward.dot(chunk_dir);
-                    let is_in_view = dot_prod > 0.3;
-
-                    if is_near || is_in_view {
-                        if let Some(chunk_instances) = self.world.chunks.get(&(x, z)) {
-                            self.scratch_instances.extend_from_slice(chunk_instances);
-                        }
-                    }
-                }
+        // 2. Move Z (using potentially modified velocity)
+        let next_z = next_pos + glam::Vec3::new(0.0, 0.0, self.velocity.z * dt);
+        if let Some(normal) = self.check_collision(next_z) {
+            // SLIDE: Same logic for Z
+            let dot = self.velocity.dot(normal);
+            if dot < 0.0 {
+                self.velocity -= normal * dot;
             }
-
-            self.num_draw_instances = self.scratch_instances.len() as u32;
-            if self.scratch_instances.len() > self.instance_capacity {
-                self.instance_capacity = (self.scratch_instances.len() as f32 * 1.5) as usize;
-                self.instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("Instance Buffer"),
-                    size: (self.instance_capacity * std::mem::size_of::<InstanceRaw>()) as u64,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-            }
-            if self.num_draw_instances > 0 {
-                self.queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&self.scratch_instances));
-            }
+        } else {
+            next_pos.z = next_z.z;
         }
+
+        // 3. Move Y
+        next_pos.y += self.velocity.y * dt;
+        if next_pos.y < 1.8 {
+            next_pos.y = 1.8;
+            self.velocity.y = 0.0;
+            self.on_ground = true;
+        } else {
+            self.on_ground = false;
+        }
+
+        self.camera.eye = next_pos;
+
+        // Update Uniforms
+        self.camera_uniform.view_proj = self.camera.build_view_projection_matrix().to_cols_array_2d();
+        self.camera_uniform.camera_pos = [self.camera.eye.x, self.camera.eye.y, self.camera.eye.z, 0.0];
+        self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.msaa_texture, resolve_target: Some(&view), 
+                    view: &self.msaa_texture, resolve_target: Some(&view),
+                    // CLEAR BLACK
                     ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -351,13 +377,17 @@ impl State {
                 }),
                 timestamp_writes: None, occlusion_query_set: None,
             });
+
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..self.num_indices, 0, 0..self.num_draw_instances);
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+
+            render_pass.set_pipeline(&self.ui_pipeline);
+            render_pass.draw(0..4, 0..1); 
         }
+
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
         Ok(())
