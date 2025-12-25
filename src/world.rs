@@ -3,6 +3,12 @@ use std::fs::File;
 use std::io::BufReader;
 use serde::Deserialize;
 use earcutr::earcut;
+use std::sync::mpsc::Sender;
+
+pub enum LoaderMessage {
+    Progress(f32), 
+    Done(World),
+}
 
 const ORIGIN_LAT: f64 = 40.771220;
 const ORIGIN_LON: f64 = -73.979577;
@@ -45,28 +51,44 @@ pub struct World {
 }
 
 impl World {
-    pub fn generate() -> Self {
+    pub fn generate(tx: Sender<LoaderMessage>) -> Self {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         let mut collision_map: HashMap<(i32, i32), Vec<WallCollider>> = HashMap::new();
 
-        println!("Loading 'nyc.json'...");
+        let _ = tx.send(LoaderMessage::Progress(0.01));
+        
         let file = File::open("nyc.json").expect("Failed to open nyc.json");
         let reader = BufReader::new(file);
+        
+        let _ = tx.send(LoaderMessage::Progress(0.05));
         let osm_data: OsmResponse = serde_json::from_reader(reader).expect("Failed to parse JSON");
-
-        println!("Processing {} elements...", osm_data.elements.len());
+        
+        let _ = tx.send(LoaderMessage::Progress(0.10));
 
         let mut node_map: HashMap<u64, (f64, f64)> = HashMap::new();
-
         for el in &osm_data.elements {
             if el.e_type == "node" {
                 node_map.insert(el.id, (el.lat, el.lon));
             }
         }
 
-        for el in &osm_data.elements {
-            // Only process valid buildings
+        let total_elements = osm_data.elements.len();
+        let mut last_percent = 0;
+
+        for (i, el) in osm_data.elements.iter().enumerate() {
+            
+            // --- THROTTLING LOGIC ---
+            // Only send message if percentage changed integer value to reduce channel overhead
+            let percent = ((i as f32 / total_elements as f32) * 100.0) as i32;
+            if percent > last_percent {
+                last_percent = percent;
+                // Map 10% -> 95% range
+                let p = 0.10 + (percent as f32 / 100.0) * 0.85;
+                let _ = tx.send(LoaderMessage::Progress(p));
+            }
+            // ------------------------
+
             if el.e_type == "way" && el.tags.as_ref().map_or(false, |t| t.contains_key("building")) {
                 let tags = el.tags.as_ref().unwrap();
                 
@@ -80,8 +102,6 @@ impl World {
                     8.0 + (pseudo_rand * 0.3)
                 };
 
-                // VISUAL DISTINCTION: Increased Variance
-                // Range approx 0.1 to 0.4 grey
                 let noise = (el.id % 30) as f32 / 100.0; 
                 let c = 0.1 + noise;
                 let building_color = [c, c, c]; 
@@ -164,7 +184,8 @@ impl World {
         indices.push(v_start+0); indices.push(v_start+2); indices.push(v_start+1);
         indices.push(v_start+0); indices.push(v_start+3); indices.push(v_start+2);
 
-        println!("World generated: {} vertices, {} indices.", vertices.len(), indices.len());
+        let _ = tx.send(LoaderMessage::Progress(1.0));
+        
         Self { vertices, indices, collision_map }
     }
 }

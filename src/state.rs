@@ -3,44 +3,17 @@ use wgpu::util::DeviceExt;
 use std::time::Instant;
 use crate::{camera::{Camera, CameraUniform, CameraController}, world::*, shader};
 
-pub struct State {
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+pub struct GpuContext {
+    pub surface: wgpu::Surface<'static>,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
-    
-    // Pipelines
-    render_pipeline: wgpu::RenderPipeline,
-    ui_pipeline: wgpu::RenderPipeline,
-
-    // Buffers
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    num_indices: u32,
-    
-    // Components
-    world: World,
-    pub camera: Camera,
-    camera_controller: CameraController,
-    camera_uniform: CameraUniform,
-    camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
-    
-    // Textures
-    depth_texture: wgpu::TextureView,
-    msaa_texture: wgpu::TextureView,
-    
-    // Logic
-    pub mouse_captured: bool,
-    last_frame_time: Instant,
-    
-    // PHYSICS
-    velocity: glam::Vec3,
-    on_ground: bool,
+    pub msaa_texture: wgpu::TextureView,
+    pub depth_texture: wgpu::TextureView,
 }
 
-impl State {
+impl GpuContext {
     pub async fn new(window: std::sync::Arc<Window>) -> Self {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
@@ -57,125 +30,31 @@ impl State {
         ).await.unwrap();
 
         let config = surface.get_default_config(&adapter, size.width, size.height).unwrap();
+        // Start with FIFO (VSync) to prevent Loading Screen from eating 100% CPU
         let mut vsync_config = config.clone();
-        vsync_config.present_mode = wgpu::PresentMode::AutoNoVsync; 
+        vsync_config.present_mode = wgpu::PresentMode::Fifo; 
         surface.configure(&device, &vsync_config);
 
-        // --- WORLD & BUFFERS ---
-        let world = World::generate();
-        
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&world.vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(&world.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-
-        // --- CAMERA ---
-        let aspect = vsync_config.width as f32 / vsync_config.height as f32;
-        let camera = Camera {
-            eye: (0.0, 50.0, 0.0).into(),
-            velocity: glam::Vec3::ZERO,
-            yaw: -90.0f32.to_radians(), pitch: 0.0, aspect,
-        };
-        
-        let mut camera_uniform = CameraUniform { 
-            view_proj: [[0.0; 4]; 4], 
-            screen_size: [vsync_config.width as f32, vsync_config.height as f32], 
-            fog_dist: [100.0, 2500.0],
-            camera_pos: [camera.eye.x, camera.eye.y, camera.eye.z, 0.0],
-        };
-        camera_uniform.view_proj = camera.build_view_projection_matrix().to_cols_array_2d();
-
-        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Camera Buffer"), contents: bytemuck::cast_slice(&[camera_uniform]), usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let camera_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0, visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
-            }], label: None,
-        });
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &camera_bind_group_layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: camera_buffer.as_entire_binding() }], label: None,
-        });
-
-        // --- PIPELINES ---
-        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Shader"), source: wgpu::ShaderSource::Wgsl(shader::SCENE_SHADER.into()),
-        });
-
-        let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[&camera_bind_group_layout], push_constant_ranges: &[],
-        });
-
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"), layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader_module, entry_point: "vs_main",
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<WorldVertex>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute { offset: 0,  shader_location: 0, format: wgpu::VertexFormat::Float32x3 }, // Position
-                        wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x3 }, // Normal
-                        wgpu::VertexAttribute { offset: 24, shader_location: 2, format: wgpu::VertexFormat::Float32x3 }, // Color
-                    ],
-                }],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader_module, entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState { format: vsync_config.format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })],
-            }),
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
-            depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::Less, stencil: wgpu::StencilState::default(), bias: wgpu::DepthBiasState::default() }),
-            multisample: wgpu::MultisampleState { count: 4, mask: !0, alpha_to_coverage_enabled: false },
-            multiview: None,
-        });
-
-        // UI Shader (Crosshair)
-        let ui_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("UI Shader"), source: wgpu::ShaderSource::Wgsl(shader::UI_SHADER.into()),
-        });
-
-        let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("UI Pipeline"), layout: None,
-            vertex: wgpu::VertexState { module: &ui_shader_module, entry_point: "vs_main", buffers: &[] },
-            fragment: Some(wgpu::FragmentState {
-                module: &ui_shader_module, entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState { format: vsync_config.format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
-            }),
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState { count: 4, mask: !0, alpha_to_coverage_enabled: false },
-            multiview: None,
-        });
-
-        let depth_texture = Self::create_depth_texture(&device, &vsync_config);
         let msaa_texture = Self::create_msaa_texture(&device, &vsync_config);
+        let depth_texture = Self::create_depth_texture(&device, &vsync_config);
 
-        Self {
-            surface, device, queue, config: vsync_config, size,
-            render_pipeline, ui_pipeline, vertex_buffer, index_buffer,
-            num_indices: world.indices.len() as u32,
-            world, camera, camera_controller: CameraController::new(),
-            camera_uniform, camera_buffer, camera_bind_group,
-            depth_texture, msaa_texture,
-            mouse_captured: false, last_frame_time: Instant::now(),
-            velocity: glam::Vec3::ZERO,
-            on_ground: false,
+        Self { surface, device, queue, config: vsync_config, size, msaa_texture, depth_texture }
+    }
+
+    // Switch to NoVsync for gameplay
+    pub fn enable_game_mode(&mut self) {
+        self.config.present_mode = wgpu::PresentMode::AutoNoVsync;
+        self.surface.configure(&self.device, &self.config);
+    }
+
+    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        if new_size.width > 0 && new_size.height > 0 {
+            self.size = new_size;
+            self.config.width = new_size.width;
+            self.config.height = new_size.height;
+            self.surface.configure(&self.device, &self.config);
+            self.msaa_texture = Self::create_msaa_texture(&self.device, &self.config);
+            self.depth_texture = Self::create_depth_texture(&self.device, &self.config);
         }
     }
 
@@ -198,18 +77,131 @@ impl State {
         };
         device.create_texture(&desc).create_view(&wgpu::TextureViewDescriptor::default())
     }
+}
+
+pub struct GameState {
+    pub ctx: GpuContext, 
+    render_pipeline: wgpu::RenderPipeline,
+    ui_pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    num_indices: u32,
+    world: World,
+    pub camera: Camera,
+    camera_controller: CameraController,
+    camera_uniform: CameraUniform,
+    camera_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
+    pub mouse_captured: bool,
+    last_frame_time: Instant,
+    velocity: glam::Vec3,
+    on_ground: bool,
+}
+
+impl GameState {
+    pub fn new(mut ctx: GpuContext, world: World) -> Self {
+        // Switch to fast rendering mode
+        ctx.enable_game_mode();
+
+        let vertex_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"), contents: bytemuck::cast_slice(&world.vertices), usage: wgpu::BufferUsages::VERTEX,
+        });
+        
+        let index_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Index Buffer"), contents: bytemuck::cast_slice(&world.indices), usage: wgpu::BufferUsages::INDEX,
+        });
+
+        let aspect = ctx.config.width as f32 / ctx.config.height as f32;
+        let camera = Camera {
+            eye: (0.0, 50.0, 0.0).into(), velocity: glam::Vec3::ZERO,
+            yaw: -90.0f32.to_radians(), pitch: 0.0, aspect,
+        };
+        
+        let mut camera_uniform = CameraUniform { 
+            view_proj: [[0.0; 4]; 4], screen_size: [ctx.config.width as f32, ctx.config.height as f32], 
+            fog_dist: [100.0, 2500.0], camera_pos: [camera.eye.x, camera.eye.y, camera.eye.z, 0.0],
+        };
+        camera_uniform.view_proj = camera.build_view_projection_matrix().to_cols_array_2d();
+
+        let camera_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Camera Buffer"), contents: bytemuck::cast_slice(&[camera_uniform]), usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let camera_bind_group_layout = ctx.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0, visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+            }], label: None,
+        });
+        let camera_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &camera_bind_group_layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: camera_buffer.as_entire_binding() }], label: None,
+        });
+
+        let shader_module = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Shader"), source: wgpu::ShaderSource::Wgsl(shader::SCENE_SHADER.into()),
+        });
+
+        let render_pipeline_layout = ctx.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[&camera_bind_group_layout], push_constant_ranges: &[],
+        });
+
+        let render_pipeline = ctx.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"), layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader_module, entry_point: "vs_main",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<WorldVertex>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute { offset: 0,  shader_location: 0, format: wgpu::VertexFormat::Float32x3 }, 
+                        wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x3 }, 
+                        wgpu::VertexAttribute { offset: 24, shader_location: 2, format: wgpu::VertexFormat::Float32x3 }, 
+                    ],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader_module, entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState { format: ctx.config.format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::Less, stencil: wgpu::StencilState::default(), bias: wgpu::DepthBiasState::default() }),
+            multisample: wgpu::MultisampleState { count: 4, mask: !0, alpha_to_coverage_enabled: false },
+            multiview: None,
+        });
+
+        let ui_shader_module = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("UI Shader"), source: wgpu::ShaderSource::Wgsl(shader::UI_SHADER.into()),
+        });
+
+        let ui_pipeline = ctx.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("UI Pipeline"), layout: None,
+            vertex: wgpu::VertexState { module: &ui_shader_module, entry_point: "vs_main", buffers: &[] },
+            fragment: Some(wgpu::FragmentState {
+                module: &ui_shader_module, entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState { format: ctx.config.format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: false, depth_compare: wgpu::CompareFunction::Always, stencil: wgpu::StencilState::default(), bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: 4, mask: !0, alpha_to_coverage_enabled: false },
+            multiview: None,
+        });
+
+        Self {
+            ctx, render_pipeline, ui_pipeline, vertex_buffer, index_buffer,
+            num_indices: world.indices.len() as u32,
+            world, camera, camera_controller: CameraController::new(),
+            camera_uniform, camera_buffer, camera_bind_group,
+            mouse_captured: false, last_frame_time: Instant::now(),
+            velocity: glam::Vec3::ZERO, on_ground: false,
+        }
+    }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
-            self.size = new_size;
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
-            self.surface.configure(&self.device, &self.config);
-            self.camera.aspect = self.config.width as f32 / self.config.height as f32;
-            self.depth_texture = Self::create_depth_texture(&self.device, &self.config);
-            self.msaa_texture = Self::create_msaa_texture(&self.device, &self.config);
-            self.camera_uniform.screen_size = [self.config.width as f32, self.config.height as f32];
-        }
+        self.ctx.resize(new_size);
+        self.camera.aspect = self.ctx.config.width as f32 / self.ctx.config.height as f32;
+        self.camera_uniform.screen_size = [self.ctx.config.width as f32, self.ctx.config.height as f32];
     }
 
     pub fn input(&mut self, event: &WindowEvent) -> bool {
@@ -225,10 +217,8 @@ impl State {
         }
     }
 
-    // UPDATED: Now returns Option<Normal Vector>
-    // This allows us to calculate sliding direction
     fn check_collision(&self, new_pos: glam::Vec3) -> Option<glam::Vec3> {
-        let player_radius = 0.3; // Tighter radius to avoid phantom hits
+        let player_radius = 0.3; 
         let wall_thickness = 0.1;
         let collision_dist = player_radius + wall_thickness;
         let collision_dist_sq = collision_dist * collision_dist;
@@ -242,33 +232,25 @@ impl State {
                     for wall in walls {
                         if new_pos.y > wall.height { continue; }
                         
-                        // AABB Rejection
-                        if new_pos.x < wall.min_x - collision_dist ||
-                           new_pos.x > wall.max_x + collision_dist ||
-                           new_pos.z < wall.min_z - collision_dist ||
-                           new_pos.z > wall.max_z + collision_dist {
+                        if new_pos.x < wall.min_x - collision_dist || new_pos.x > wall.max_x + collision_dist ||
+                           new_pos.z < wall.min_z - collision_dist || new_pos.z > wall.max_z + collision_dist {
                             continue;
                         }
 
-                        // Distance to Line Segment
                         let p = glam::Vec2::new(new_pos.x, new_pos.z);
                         let a = wall.start;
                         let b = wall.end;
-                        
                         let ab = b - a;
                         let ap = p - a;
-                        
                         let t = (ap.dot(ab) / ab.length_squared()).clamp(0.0, 1.0);
                         let closest = a + ab * t;
                         
                         if p.distance_squared(closest) < collision_dist_sq {
-                            // Calculate Normal to slide against
                             let push_vec = p - closest;
                             if push_vec.length_squared() > 0.00001 {
                                 let normal_2d = push_vec.normalize();
                                 return Some(glam::Vec3::new(normal_2d.x, 0.0, normal_2d.y));
                             } else {
-                                // Fallback normal if exactly inside
                                 return Some(glam::Vec3::new(1.0, 0.0, 0.0));
                             }
                         }
@@ -298,9 +280,7 @@ impl State {
         if self.camera_controller.move_right { input_dir += right; }
         if self.camera_controller.move_left { input_dir -= right; }
 
-        if input_dir.length_squared() > 0.0 {
-            input_dir = input_dir.normalize();
-        }
+        if input_dir.length_squared() > 0.0 { input_dir = input_dir.normalize(); }
         
         self.velocity.x = input_dir.x * move_speed;
         self.velocity.z = input_dir.z * move_speed;
@@ -311,67 +291,48 @@ impl State {
             self.on_ground = false;
         }
 
-        // --- GLIDE / SLIDE PHYSICS ---
         let mut next_pos = self.camera.eye;
         
-        // 1. Move X
         let next_x = next_pos + glam::Vec3::new(self.velocity.x * dt, 0.0, 0.0);
         if let Some(normal) = self.check_collision(next_x) {
-            // SLIDE: Remove velocity component opposing the wall
-            // Project velocity onto the wall plane
             let dot = self.velocity.dot(normal);
-            if dot < 0.0 {
-                self.velocity -= normal * dot;
-            }
-        } else {
-            next_pos.x = next_x.x;
-        }
+            if dot < 0.0 { self.velocity -= normal * dot; }
+        } else { next_pos.x = next_x.x; }
 
-        // 2. Move Z (using potentially modified velocity)
         let next_z = next_pos + glam::Vec3::new(0.0, 0.0, self.velocity.z * dt);
         if let Some(normal) = self.check_collision(next_z) {
-            // SLIDE: Same logic for Z
             let dot = self.velocity.dot(normal);
-            if dot < 0.0 {
-                self.velocity -= normal * dot;
-            }
-        } else {
-            next_pos.z = next_z.z;
-        }
+            if dot < 0.0 { self.velocity -= normal * dot; }
+        } else { next_pos.z = next_z.z; }
 
-        // 3. Move Y
         next_pos.y += self.velocity.y * dt;
         if next_pos.y < 1.8 {
             next_pos.y = 1.8;
             self.velocity.y = 0.0;
             self.on_ground = true;
-        } else {
-            self.on_ground = false;
-        }
+        } else { self.on_ground = false; }
 
         self.camera.eye = next_pos;
 
-        // Update Uniforms
         self.camera_uniform.view_proj = self.camera.build_view_projection_matrix().to_cols_array_2d();
         self.camera_uniform.camera_pos = [self.camera.eye.x, self.camera.eye.y, self.camera.eye.z, 0.0];
-        self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
+        self.ctx.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        let output = self.surface.get_current_texture()?;
+        let output = self.ctx.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let mut encoder = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.msaa_texture, resolve_target: Some(&view),
-                    // CLEAR BLACK
+                    view: &self.ctx.msaa_texture, resolve_target: Some(&view),
                     ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_texture,
+                    view: &self.ctx.depth_texture,
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),
@@ -388,7 +349,7 @@ impl State {
             render_pass.draw(0..4, 0..1); 
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.ctx.queue.submit(std::iter::once(encoder.finish()));
         output.present();
         Ok(())
     }
