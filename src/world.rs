@@ -1,11 +1,11 @@
 // world.rs
 use std::collections::HashMap;
-use crate::config;
-use crate::vertex::Vertex;
+use crate::{config, vertex::Vertex};
 
 pub enum LoaderMessage {
+    Status(String),
     Progress(f32),
-    ChunkLoaded(ChunkData),
+    BatchLoaded(Vec<ChunkData>),
     Done,
 }
 
@@ -18,7 +18,7 @@ pub struct WallCollider {
     pub min_z: f32, pub max_z: f32,
 }
 
-// Data Packet from Loader Thread
+#[derive(Clone)]
 pub struct ChunkData {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
@@ -26,7 +26,6 @@ pub struct ChunkData {
     pub coord: (i32, i32),
 }
 
-// Local Grid for Fast Physics
 pub struct LocalCollisionGrid {
     pub cells: Vec<Vec<WallCollider>>,
     pub cell_size: f32,
@@ -99,13 +98,17 @@ impl World {
 
     pub fn insert_chunk(&mut self, device: &wgpu::Device, data: ChunkData) {
         use wgpu::util::DeviceExt;
+        
+        // Don't upload empty chunks
+        if data.indices.is_empty() { return; }
+
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(&format!("Chunk {:?} Verts", data.coord)),
+            label: Some(&format!("Chunk {:?} V", data.coord)),
             contents: bytemuck::cast_slice(&data.vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(&format!("Chunk {:?} Inds", data.coord)),
+            label: Some(&format!("Chunk {:?} I", data.coord)),
             contents: bytemuck::cast_slice(&data.indices),
             usage: wgpu::BufferUsages::INDEX,
         });

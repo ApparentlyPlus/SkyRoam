@@ -7,6 +7,7 @@ use wgpu::util::DeviceExt;
 use std::time::Instant;
 use std::sync::mpsc;
 use std::thread;
+use std::sync::Arc;
 
 mod config;
 mod shader;
@@ -19,7 +20,6 @@ mod state;
 use state::{GameState, GpuContext};
 use world::LoaderMessage;
 
-// --- Loading Screen Renderer ---
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct LoadingUniforms {
@@ -31,6 +31,7 @@ struct LoadingScreen {
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     pub current_progress: f32,
+    pub status_text: String,
 }
 
 impl LoadingScreen {
@@ -53,7 +54,7 @@ impl LoadingScreen {
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_main", targets: &[Some(wgpu::ColorTargetState { format: ctx.config.format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None,
         });
-        Self { pipeline, uniform_buffer, bind_group, current_progress: 0.0 }
+        Self { pipeline, uniform_buffer, bind_group, current_progress: 0.0, status_text: "Initializing".into() }
     }
     
     fn render(&self, ctx: &mut GpuContext) {
@@ -90,31 +91,36 @@ fn main() {
     
     let builder = WindowBuilder::new().with_title(config::WINDOW_TITLE);
     let monitor = event_loop.primary_monitor();
-    let window = std::sync::Arc::new(builder.with_fullscreen(Some(Fullscreen::Borderless(monitor))).build(&event_loop).unwrap());
+    let window = Arc::new(builder.with_fullscreen(Some(Fullscreen::Borderless(monitor))).build(&event_loop).unwrap());
     
-    // "Floating" Context: Starts here, then moves into GameState
     let mut gpu_ctx_opt = Some(pollster::block_on(GpuContext::new(window.clone())));
     let mut loading_screen = LoadingScreen::new(gpu_ctx_opt.as_ref().unwrap());
 
-    // Threading
+    // Threading setup
     let (tx, rx) = mpsc::channel();
+    // Clone for the thread
+    let tx_thread = tx.clone();
+    
     thread::spawn(move || {
-        let chunks = map_loader::load_chunks_from_osm(config::MAP_FILE_PATH);
-        let total = chunks.len();
-        // Emulate streaming/processing delay
-        for (i, chunk) in chunks.into_iter().enumerate() {
-            tx.send(LoaderMessage::ChunkLoaded(chunk)).ok();
-            if i % 5 == 0 {
-                 let _ = tx.send(LoaderMessage::Progress((i + 1) as f32 / total as f32));
-                 // Tiny sleep to make the loading screen visible for the demo
-                 thread::sleep(std::time::Duration::from_millis(5)); 
-            }
-        }
-        let _ = tx.send(LoaderMessage::Done);
+        // Clone for the callback closure inside the thread
+        let tx_callback = tx_thread.clone();
+        
+        map_loader::load_chunks_from_osm_stream(config::MAP_FILE_PATH, move |chunk_batch_opt, progress, status| {
+             if let Some(batch) = chunk_batch_opt {
+                 tx_callback.send(LoaderMessage::BatchLoaded(batch)).ok();
+             }
+             if progress > 0.0 {
+                tx_callback.send(LoaderMessage::Progress(progress)).ok();
+             }
+             tx_callback.send(LoaderMessage::Status(status.to_string())).ok();
+        });
+        
+        // Use the thread's copy of tx for the final signal
+        tx_thread.send(LoaderMessage::Done).ok();
     });
 
     let mut state: Option<GameState> = None;
-    let mut is_loading_phase = true; // PRODUCTION FIX: Separate Flag
+    let mut is_loading_phase = true;
     let mut last_fps_print = Instant::now();
     let mut frames = 0;
     
@@ -126,20 +132,17 @@ fn main() {
                 match event {
                     WindowEvent::CloseRequested => elwt.exit(),
                     WindowEvent::Resized(size) => {
-                        // Resize whoever currently holds the context
                         if let Some(s) = &mut state { s.resize(*size); }
                         else if let Some(ctx) = &mut gpu_ctx_opt { ctx.resize(*size); }
                     },
                     WindowEvent::RedrawRequested => {
                         if is_loading_phase {
-                            // Render Loading Screen
                             if let Some(s) = &mut state {
                                 loading_screen.render(&mut s.ctx);
                             } else if let Some(ctx) = &mut gpu_ctx_opt {
                                 loading_screen.render(ctx);
                             }
                         } else if let Some(s) = &mut state {
-                            // Render Game
                             s.update();
                             match s.render() {
                                 Ok(_) => {}
@@ -149,7 +152,6 @@ fn main() {
                             }
                         }
                     },
-                    // Input Handling (Only if game is active)
                     WindowEvent::MouseInput { state: element_state, button: MouseButton::Left, .. } if !is_loading_phase => {
                         if *element_state == ElementState::Pressed { 
                             if let Some(s) = &mut state { s.mouse_captured = true; }
@@ -163,7 +165,6 @@ fn main() {
                         }
                     },
                     _ => {
-                        // Pass other input to GameState
                         if !is_loading_phase {
                             if let Some(s) = &mut state { s.input(event); }
                         }
@@ -172,52 +173,62 @@ fn main() {
             },
             Event::DeviceEvent { event: DeviceEvent::MouseMotion { delta }, .. } => {
                 if !is_loading_phase {
-                     if let Some(s) = &mut state { s.update_camera_rotation(delta); }
+                      if let Some(s) = &mut state { s.update_camera_rotation(delta); }
                 }
             },
             Event::AboutToWait => {
-                // 1. Process Message Queue (Non-blocking)
+                let mut chunk_loaded = false;
                 while let Ok(msg) = rx.try_recv() {
                     match msg {
+                        LoaderMessage::Status(s) => {
+                            loading_screen.status_text = s;
+                            window.request_redraw(); 
+                        },
                         LoaderMessage::Progress(p) => {
                             loading_screen.current_progress = p;
                             window.request_redraw();
                         },
-                        LoaderMessage::ChunkLoaded(data) => {
-                            // Initialize GameState on first chunk if needed
+                        LoaderMessage::BatchLoaded(batch) => {
+                            // Init State on first chunk batch
                             if state.is_none() {
                                 if let Some(ctx) = gpu_ctx_opt.take() {
                                     state = Some(GameState::new(ctx));
                                 }
+                                is_loading_phase = false;
+                                set_cursor_grab(&window, true);
                             }
-                            // Insert data
                             if let Some(s) = &mut state {
-                                s.world.insert_chunk(&s.ctx.device, data);
+                                for chunk in batch {
+                                    s.world.insert_chunk(&s.ctx.device, chunk);
+                                }
                             }
+                            chunk_loaded = true;
                         },
                         LoaderMessage::Done => {
                             loading_screen.current_progress = 1.0;
-                            // Ensure state is created even if no chunks loaded (edge case)
+                            loading_screen.status_text = "Done".into();
                             if state.is_none() {
                                 if let Some(ctx) = gpu_ctx_opt.take() { state = Some(GameState::new(ctx)); }
                             }
-                            is_loading_phase = false; // SWITCH TO GAME
-                            window.request_redraw();
+                            is_loading_phase = false;
                         }
                     }
                 }
+                
+                if chunk_loaded || !is_loading_phase {
+                     window.request_redraw();
+                }
 
-                // 2. Loop Management
                 if !is_loading_phase {
                     frames += 1;
                     if last_fps_print.elapsed().as_secs_f32() >= 1.0 {
-                        window.set_title(&format!("{} | FPS: {}", config::WINDOW_TITLE, frames));
+                        let chunk_count = state.as_ref().map(|s| s.world.chunks.len()).unwrap_or(0);
+                        let cam_y = state.as_ref().map(|s| s.camera.eye.y).unwrap_or(0.0);
+                        window.set_title(&format!("{} | FPS: {} | Chunks: {} | Y: {:.1}", config::WINDOW_TITLE, frames, chunk_count, cam_y));
                         frames = 0;
                         last_fps_print = Instant::now();
                     }
-                    window.request_redraw();
                 } else {
-                    // Reduce CPU usage slightly during loading
                     thread::sleep(std::time::Duration::from_millis(5));
                 }
             },
