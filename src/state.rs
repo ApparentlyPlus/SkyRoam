@@ -37,7 +37,6 @@ impl GpuContext {
         
         let mut final_config = config.clone();
         let caps = surface.get_capabilities(&adapter);
-        // Mailbox is crucial for Linux/Wayland latency, Fifo as fallback
         if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
             final_config.present_mode = wgpu::PresentMode::Mailbox;
         } else {
@@ -170,7 +169,6 @@ impl GameState {
                 module: &shader_module, entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState { format: ctx.config.format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })],
             }),
-            // Keep Cull Mode NONE as requested
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
             depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::Less, stencil: wgpu::StencilState::default(), bias: wgpu::DepthBiasState::default() }),
             multisample: wgpu::MultisampleState { count: 4, mask: !0, alpha_to_coverage_enabled: false },
@@ -224,9 +222,13 @@ impl GameState {
         }
     }
 
-    fn check_collision(&self, new_pos: glam::DVec3) -> Option<glam::DVec3> {
+    // FIX: Returns Normal AND Penetration Depth
+    fn check_collision(&self, new_pos: glam::DVec3) -> Option<(glam::DVec3, f64)> {
         let player_radius = 0.3; 
-        let wall_thickness = 0.1;
+        
+        // FIX: Match world.rs generation thickness (0.5).
+        // Total "physics thickness" from center = 0.5 (wall) + 0.3 (player) = 0.8
+        let wall_thickness = 0.5; 
         let collision_dist = player_radius + wall_thickness;
         let collision_dist_sq = collision_dist * collision_dist;
 
@@ -234,7 +236,7 @@ impl GameState {
         let gz = (new_pos.z / 50.0).floor() as i32;
         
         let mut min_dist_sq = collision_dist_sq as f64;
-        let mut best_normal = None;
+        let mut best_hit = None;
 
         let px = new_pos.x as f32;
         let pz = new_pos.z as f32;
@@ -264,23 +266,25 @@ impl GameState {
                         if dist_sq < min_dist_sq {
                             min_dist_sq = dist_sq;
                             let push_vec = p - closest;
-                            if push_vec.length_squared() > 0.00001 {
-                                let normal_2d = push_vec.normalize();
-                                best_normal = Some(glam::DVec3::new(normal_2d.x, 0.0, normal_2d.y));
+                            if push_vec.length_squared() > 0.0000001 {
+                                let dist = dist_sq.sqrt();
+                                let penetration = (collision_dist as f64) - dist;
+                                let normal = glam::DVec3::new(push_vec.x / dist, 0.0, push_vec.y / dist);
+                                best_hit = Some((normal, penetration));
                             } else {
-                                best_normal = Some(glam::DVec3::new(1.0, 0.0, 0.0));
+                                // Direct hit on center? Push X
+                                best_hit = Some((glam::DVec3::new(1.0, 0.0, 0.0), collision_dist as f64));
                             }
                         }
                     }
                 }
             }
         }
-        best_normal
+        best_hit
     }
 
     pub fn update(&mut self) {
         let now = Instant::now();
-        // Clamping dt to 0.1 prevents HUGE jumps, but it's not enough for low FPS tunneling.
         let dt = now.duration_since(self.last_frame_time).as_secs_f64().clamp(0.0001, 0.1);
         self.last_frame_time = now;
 
@@ -308,26 +312,26 @@ impl GameState {
             self.velocity.y = jump_force;
             self.on_ground = false;
         }
-        
+
         let mut remaining_dt = dt;
-        let step_size = 0.02; // 50 Hz physics minimum
+        let step_size = 0.02; 
 
         while remaining_dt > 0.0 {
             let step = remaining_dt.min(step_size);
             
-            // Predict Movement
+            // Move
             let mut next_pos = self.camera.eye + self.velocity * step;
             
-            // Resolve Collisions (Iterative "Collide & Slide")
+            // Resolve Collisions (4 Passes)
             for _ in 0..4 {
-                if let Some(normal) = self.check_collision(next_pos) {
+                if let Some((normal, depth)) = self.check_collision(next_pos) {
+                    // Slide Velocity
                     let dot = self.velocity.dot(normal);
                     if dot < 0.0 {
                         self.velocity -= normal * dot;
                     }
-                    
-                    // Push out slightly to prevent getting stuck in walls
-                    next_pos += normal * 0.005; 
+
+                    next_pos += normal * (depth + 0.0001); 
                 } else {
                     break;
                 }
