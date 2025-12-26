@@ -25,26 +25,30 @@ impl GpuContext {
         }).await.unwrap();
 
         let (device, queue) = adapter.request_device(
-            &wgpu::DeviceDescriptor { label: None, required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::default() },
+            &wgpu::DeviceDescriptor { 
+                label: None, 
+                required_features: wgpu::Features::empty(), 
+                required_limits: wgpu::Limits::default() 
+            },
             None,
         ).await.unwrap();
 
         let config = surface.get_default_config(&adapter, size.width, size.height).unwrap();
-        // Start with FIFO (VSync) to prevent Loading Screen from eating 100% CPU
-        let mut vsync_config = config.clone();
-        vsync_config.present_mode = wgpu::PresentMode::Fifo; 
-        surface.configure(&device, &vsync_config);
+        
+        let mut final_config = config.clone();
+        let caps = surface.get_capabilities(&adapter);
+        if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            final_config.present_mode = wgpu::PresentMode::Mailbox;
+        } else {
+            final_config.present_mode = wgpu::PresentMode::Fifo;
+        }
 
-        let msaa_texture = Self::create_msaa_texture(&device, &vsync_config);
-        let depth_texture = Self::create_depth_texture(&device, &vsync_config);
+        surface.configure(&device, &final_config);
 
-        Self { surface, device, queue, config: vsync_config, size, msaa_texture, depth_texture }
-    }
+        let msaa_texture = Self::create_msaa_texture(&device, &final_config);
+        let depth_texture = Self::create_depth_texture(&device, &final_config);
 
-    // Switch to NoVsync for gameplay
-    pub fn enable_game_mode(&mut self) {
-        self.config.present_mode = wgpu::PresentMode::AutoNoVsync;
-        self.surface.configure(&self.device, &self.config);
+        Self { surface, device, queue, config: final_config, size, msaa_texture, depth_texture }
     }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
@@ -85,7 +89,6 @@ pub struct GameState {
     ui_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
-    num_indices: u32,
     world: World,
     pub camera: Camera,
     camera_controller: CameraController,
@@ -94,15 +97,13 @@ pub struct GameState {
     camera_bind_group: wgpu::BindGroup,
     pub mouse_captured: bool,
     last_frame_time: Instant,
-    velocity: glam::Vec3,
+    velocity: glam::DVec3, 
     on_ground: bool,
 }
 
 impl GameState {
     pub fn new(mut ctx: GpuContext, world: World) -> Self {
-        // Switch to fast rendering mode
-        ctx.enable_game_mode();
-
+        
         let vertex_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"), contents: bytemuck::cast_slice(&world.vertices), usage: wgpu::BufferUsages::VERTEX,
         });
@@ -112,14 +113,19 @@ impl GameState {
         });
 
         let aspect = ctx.config.width as f32 / ctx.config.height as f32;
+        
         let camera = Camera {
-            eye: (0.0, 50.0, 0.0).into(), velocity: glam::Vec3::ZERO,
-            yaw: -90.0f32.to_radians(), pitch: 0.0, aspect,
+            eye: glam::DVec3::new(0.0, 50.0, 0.0), 
+            velocity: glam::DVec3::ZERO,
+            yaw: -90.0f32.to_radians(), 
+            pitch: 0.0, 
+            aspect,
         };
         
         let mut camera_uniform = CameraUniform { 
             view_proj: [[0.0; 4]; 4], screen_size: [ctx.config.width as f32, ctx.config.height as f32], 
-            fog_dist: [100.0, 2500.0], camera_pos: [camera.eye.x, camera.eye.y, camera.eye.z, 0.0],
+            fog_dist: [100.0, 3000.0], 
+            camera_pos: [camera.eye.x as f32, camera.eye.y as f32, camera.eye.z as f32, 0.0],
         };
         camera_uniform.view_proj = camera.build_view_projection_matrix().to_cols_array_2d();
 
@@ -163,6 +169,8 @@ impl GameState {
                 module: &shader_module, entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState { format: ctx.config.format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })],
             }),
+            // FIX: DISABLE CULLING TO FIX MISSING FACES
+            // Inconsistent OSM winding data requires this.
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
             depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::Less, stencil: wgpu::StencilState::default(), bias: wgpu::DepthBiasState::default() }),
             multisample: wgpu::MultisampleState { count: 4, mask: !0, alpha_to_coverage_enabled: false },
@@ -190,11 +198,10 @@ impl GameState {
 
         Self {
             ctx, render_pipeline, ui_pipeline, vertex_buffer, index_buffer,
-            num_indices: world.indices.len() as u32,
             world, camera, camera_controller: CameraController::new(),
             camera_uniform, camera_buffer, camera_bind_group,
             mouse_captured: false, last_frame_time: Instant::now(),
-            velocity: glam::Vec3::ZERO, on_ground: false,
+            velocity: glam::DVec3::ZERO, on_ground: false,
         }
     }
 
@@ -217,7 +224,7 @@ impl GameState {
         }
     }
 
-    fn check_collision(&self, new_pos: glam::Vec3) -> Option<glam::Vec3> {
+    fn check_collision(&self, new_pos: glam::DVec3) -> Option<glam::DVec3> {
         let player_radius = 0.3; 
         let wall_thickness = 0.1;
         let collision_dist = player_radius + wall_thickness;
@@ -226,55 +233,65 @@ impl GameState {
         let gx = (new_pos.x / 50.0).floor() as i32;
         let gz = (new_pos.z / 50.0).floor() as i32;
         
+        let mut min_dist_sq = collision_dist_sq as f64;
+        let mut best_normal = None;
+
+        let px = new_pos.x as f32;
+        let pz = new_pos.z as f32;
+        let cd = collision_dist as f32;
+
         for ox in -1..=1 {
             for oz in -1..=1 {
                 if let Some(walls) = self.world.collision_map.get(&(gx + ox, gz + oz)) {
                     for wall in walls {
-                        if new_pos.y > wall.height { continue; }
+                        if (new_pos.y as f32) > wall.height { continue; }
                         
-                        if new_pos.x < wall.min_x - collision_dist || new_pos.x > wall.max_x + collision_dist ||
-                           new_pos.z < wall.min_z - collision_dist || new_pos.z > wall.max_z + collision_dist {
+                        if px < wall.min_x - cd || px > wall.max_x + cd ||
+                           pz < wall.min_z - cd || pz > wall.max_z + cd {
                             continue;
                         }
 
-                        let p = glam::Vec2::new(new_pos.x, new_pos.z);
-                        let a = wall.start;
-                        let b = wall.end;
+                        let p = glam::DVec2::new(new_pos.x, new_pos.z);
+                        let a = glam::DVec2::new(wall.start.x as f64, wall.start.y as f64);
+                        let b = glam::DVec2::new(wall.end.x as f64, wall.end.y as f64);
                         let ab = b - a;
                         let ap = p - a;
                         let t = (ap.dot(ab) / ab.length_squared()).clamp(0.0, 1.0);
                         let closest = a + ab * t;
                         
-                        if p.distance_squared(closest) < collision_dist_sq {
+                        let dist_sq = p.distance_squared(closest);
+
+                        if dist_sq < min_dist_sq {
+                            min_dist_sq = dist_sq;
                             let push_vec = p - closest;
                             if push_vec.length_squared() > 0.00001 {
                                 let normal_2d = push_vec.normalize();
-                                return Some(glam::Vec3::new(normal_2d.x, 0.0, normal_2d.y));
+                                best_normal = Some(glam::DVec3::new(normal_2d.x, 0.0, normal_2d.y));
                             } else {
-                                return Some(glam::Vec3::new(1.0, 0.0, 0.0));
+                                best_normal = Some(glam::DVec3::new(1.0, 0.0, 0.0));
                             }
                         }
                     }
                 }
             }
         }
-        None
+        best_normal
     }
 
     pub fn update(&mut self) {
         let now = Instant::now();
-        let dt = now.duration_since(self.last_frame_time).as_secs_f32().clamp(0.0001, 0.1);
+        let dt = now.duration_since(self.last_frame_time).as_secs_f64().clamp(0.0001, 0.1);
         self.last_frame_time = now;
 
-        let move_speed = 10.0; 
+        let move_speed = 10.0;
         let gravity = 35.0; 
         let jump_force = 12.0;
 
         let (sin_yaw, cos_yaw) = self.camera.yaw.sin_cos();
-        let forward = glam::Vec3::new(cos_yaw, 0.0, sin_yaw).normalize();
-        let right = glam::Vec3::new(-sin_yaw, 0.0, cos_yaw).normalize();
+        let forward = glam::DVec3::new(cos_yaw as f64, 0.0, sin_yaw as f64).normalize();
+        let right = glam::DVec3::new(-(sin_yaw as f64), 0.0, cos_yaw as f64).normalize();
 
-        let mut input_dir = glam::Vec3::ZERO;
+        let mut input_dir = glam::DVec3::ZERO;
         if self.camera_controller.move_fwd { input_dir += forward; }
         if self.camera_controller.move_back { input_dir -= forward; }
         if self.camera_controller.move_right { input_dir += right; }
@@ -284,6 +301,7 @@ impl GameState {
         
         self.velocity.x = input_dir.x * move_speed;
         self.velocity.z = input_dir.z * move_speed;
+        
         self.velocity.y -= gravity * dt;
 
         if self.on_ground && self.camera_controller.jump {
@@ -292,30 +310,38 @@ impl GameState {
         }
 
         let mut next_pos = self.camera.eye;
-        
-        let next_x = next_pos + glam::Vec3::new(self.velocity.x * dt, 0.0, 0.0);
-        if let Some(normal) = self.check_collision(next_x) {
+        let mut dx = self.velocity.x * dt;
+        let test_x = next_pos + glam::DVec3::new(dx, 0.0, 0.0);
+        if let Some(normal) = self.check_collision(test_x) {
             let dot = self.velocity.dot(normal);
             if dot < 0.0 { self.velocity -= normal * dot; }
-        } else { next_pos.x = next_x.x; }
+            dx = self.velocity.x * dt;
+        }
+        next_pos.x += dx; 
 
-        let next_z = next_pos + glam::Vec3::new(0.0, 0.0, self.velocity.z * dt);
-        if let Some(normal) = self.check_collision(next_z) {
+        let mut dz = self.velocity.z * dt;
+        let test_z = next_pos + glam::DVec3::new(0.0, 0.0, dz);
+        if let Some(normal) = self.check_collision(test_z) {
             let dot = self.velocity.dot(normal);
             if dot < 0.0 { self.velocity -= normal * dot; }
-        } else { next_pos.z = next_z.z; }
+            dz = self.velocity.z * dt;
+        }
+        next_pos.z += dz; 
 
         next_pos.y += self.velocity.y * dt;
+
         if next_pos.y < 1.8 {
             next_pos.y = 1.8;
             self.velocity.y = 0.0;
             self.on_ground = true;
-        } else { self.on_ground = false; }
+        } else {
+            self.on_ground = false;
+        }
 
         self.camera.eye = next_pos;
 
         self.camera_uniform.view_proj = self.camera.build_view_projection_matrix().to_cols_array_2d();
-        self.camera_uniform.camera_pos = [self.camera.eye.x, self.camera.eye.y, self.camera.eye.z, 0.0];
+        self.camera_uniform.camera_pos = [self.camera.eye.x as f32, self.camera.eye.y as f32, self.camera.eye.z as f32, 0.0];
         self.ctx.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
     }
 
@@ -343,7 +369,23 @@ impl GameState {
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+
+            let cam_x = self.camera.eye.x as f32;
+            let cam_z = self.camera.eye.z as f32;
+            let draw_dist = 3000.0f32; // FIXED: Explicit f32
+
+            for chunk in &self.world.chunks {
+                let cx = (chunk.min.x + chunk.max.x) * 0.5;
+                let cz = (chunk.min.y + chunk.max.y) * 0.5; 
+                
+                let dist_sq = (cx - cam_x).powi(2) + (cz - cam_z).powi(2);
+                if dist_sq < draw_dist * draw_dist {
+                    render_pass.draw_indexed(
+                        chunk.index_start..(chunk.index_start + chunk.index_count),
+                        0, 0..1
+                    );
+                }
+            }
 
             render_pass.set_pipeline(&self.ui_pipeline);
             render_pass.draw(0..4, 0..1); 

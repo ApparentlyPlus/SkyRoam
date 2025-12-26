@@ -1,9 +1,10 @@
 use winit::event::*;
 use winit::keyboard::{KeyCode, PhysicalKey};
 
+// Use DVec3 (f64) for position to prevent jitter at large world coordinates
 pub struct Camera {
-    pub eye: glam::Vec3,
-    pub velocity: glam::Vec3,
+    pub eye: glam::DVec3,
+    pub velocity: glam::DVec3,
     pub yaw: f32,
     pub pitch: f32,
     pub aspect: f32,
@@ -13,10 +14,23 @@ impl Camera {
     pub fn build_view_projection_matrix(&self) -> glam::Mat4 {
         let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
         let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
-        let target = glam::Vec3::new(cos_pitch * cos_yaw, sin_pitch, cos_pitch * sin_yaw).normalize();
-        let view = glam::Mat4::look_at_rh(self.eye, self.eye + target, glam::Vec3::Y);
-        let proj = glam::Mat4::perspective_rh(45.0f32.to_radians(), self.aspect, 0.1, 8000.0);
-        proj * view
+
+        // Calculate target in f64 then downcast for the matrix creation if needed, 
+        // or keep high precision for the LookAt calculation.
+        let target = glam::DVec3::new(
+            (cos_pitch * cos_yaw) as f64, 
+            sin_pitch as f64, 
+            (cos_pitch * sin_yaw) as f64
+        ).normalize();
+
+        // We calculate the View Matrix in f64 first
+        let view = glam::DMat4::look_at_rh(self.eye, self.eye + target, glam::DVec3::Y);
+        
+        // Perspective is usually fine in f32
+        let proj = glam::Mat4::perspective_rh(45.0f32.to_radians(), self.aspect, 0.1, 10000.0);
+
+        // Convert View to f32 and multiply
+        proj * view.as_mat4()
     }
 }
 
@@ -26,7 +40,7 @@ pub struct CameraUniform {
     pub view_proj: [[f32; 4]; 4], 
     pub screen_size: [f32; 2],    
     pub fog_dist: [f32; 2], 
-    pub camera_pos: [f32; 4],     
+    pub camera_pos: [f32; 4],      
 }
 
 pub struct CameraController {

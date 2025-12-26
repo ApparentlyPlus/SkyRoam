@@ -12,8 +12,12 @@ pub enum LoaderMessage {
 
 const ORIGIN_LAT: f64 = 40.771220;
 const ORIGIN_LON: f64 = -73.979577;
-const METERS_PER_DEGREE_LAT: f64 = 111000.0;
-const METERS_PER_DEGREE_LON: f64 = 85000.0; 
+const METERS_PER_DEGREE_LAT: f64 = 111132.0;
+
+// World Grid Settings
+const CHUNKS_AXIS: i32 = 16; 
+const WORLD_SIZE: f32 = 10000.0; 
+const CHUNK_SIZE: f32 = WORLD_SIZE / CHUNKS_AXIS as f32;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -44,26 +48,39 @@ struct OsmElement {
     #[serde(default)] tags: Option<HashMap<String, String>>,
 }
 
+#[derive(Debug)]
+pub struct ChunkView {
+    pub index_start: u32,
+    pub index_count: u32,
+    pub min: glam::Vec2, 
+    pub max: glam::Vec2, 
+}
+
 pub struct World {
     pub vertices: Vec<WorldVertex>,
-    pub indices:  Vec<u32>,
+    pub indices: Vec<u32>,
+    pub chunks: Vec<ChunkView>,
     pub collision_map: HashMap<(i32, i32), Vec<WallCollider>>,
 }
 
 impl World {
     pub fn generate(tx: Sender<LoaderMessage>) -> Self {
-        let mut vertices = Vec::new();
-        let mut indices = Vec::new();
+        let mut chunk_builders: Vec<(Vec<WorldVertex>, Vec<u32>)> = 
+            (0..(CHUNKS_AXIS * CHUNKS_AXIS)).map(|_| (Vec::new(), Vec::new())).collect();
+
         let mut collision_map: HashMap<(i32, i32), Vec<WallCollider>> = HashMap::new();
+
+        let lat_rad = ORIGIN_LAT.to_radians();
+        let meters_per_degree_lon = 111319.5 * lat_rad.cos();
 
         let _ = tx.send(LoaderMessage::Progress(0.01));
         
-        let file = File::open("nyc.json").expect("Failed to open nyc.json");
+        let file = match File::open("nyc.json") {
+            Ok(f) => f,
+            Err(_) => return Self { vertices: vec![], indices: vec![], chunks: vec![], collision_map },
+        };
         let reader = BufReader::new(file);
-        
-        let _ = tx.send(LoaderMessage::Progress(0.05));
-        let osm_data: OsmResponse = serde_json::from_reader(reader).expect("Failed to parse JSON");
-        
+        let osm_data: OsmResponse = serde_json::from_reader(reader).unwrap_or(OsmResponse { elements: vec![] });
         let _ = tx.send(LoaderMessage::Progress(0.10));
 
         let mut node_map: HashMap<u64, (f64, f64)> = HashMap::new();
@@ -77,17 +94,14 @@ impl World {
         let mut last_percent = 0;
 
         for (i, el) in osm_data.elements.iter().enumerate() {
-            
-            // --- THROTTLING LOGIC ---
-            // Only send message if percentage changed integer value to reduce channel overhead
-            let percent = ((i as f32 / total_elements as f32) * 100.0) as i32;
-            if percent > last_percent {
-                last_percent = percent;
-                // Map 10% -> 95% range
-                let p = 0.10 + (percent as f32 / 100.0) * 0.85;
-                let _ = tx.send(LoaderMessage::Progress(p));
+            if i % 500 == 0 {
+                let percent = ((i as f32 / total_elements as f32) * 100.0) as i32;
+                if percent > last_percent {
+                    last_percent = percent;
+                    let p = 0.10 + (percent as f32 / 100.0) * 0.85;
+                    let _ = tx.send(LoaderMessage::Progress(p));
+                }
             }
-            // ------------------------
 
             if el.e_type == "way" && el.tags.as_ref().map_or(false, |t| t.contains_key("building")) {
                 let tags = el.tags.as_ref().unwrap();
@@ -102,90 +116,154 @@ impl World {
                     8.0 + (pseudo_rand * 0.3)
                 };
 
-                let noise = (el.id % 30) as f32 / 100.0; 
-                let c = 0.1 + noise;
-                let building_color = [c, c, c]; 
+                // FIX: GREYSCALE CONCRETE COLORS
+                // Varies slightly from 0.15 (dark grey) to 0.35 (light grey)
+                let seed = (el.id % 100) as f32 / 100.0; 
+                let grey = 0.15 + (seed * 0.20);
+                let building_color = [grey, grey, grey];
 
-                let mut perimeter_pts = Vec::new();
-                let mut polygon_flat = Vec::new();
-                
+                let mut raw_pts = Vec::new();
                 for node_id in &el.nodes {
                     if let Some(&(lat, lon)) = node_map.get(node_id) {
-                        let x = (lon - ORIGIN_LON) * METERS_PER_DEGREE_LON;
+                        let x = (lon - ORIGIN_LON) * meters_per_degree_lon;
                         let z = -(lat - ORIGIN_LAT) * METERS_PER_DEGREE_LAT;
-                        perimeter_pts.push(glam::Vec3::new(x as f32, 0.0, z as f32));
-                        polygon_flat.push(x);
-                        polygon_flat.push(z);
+                        raw_pts.push(glam::Vec2::new(x as f32, z as f32));
                     }
                 }
 
-                if perimeter_pts.len() < 3 { continue; }
+                if raw_pts.len() < 3 { continue; }
 
-                if let Ok(tris) = earcut(&polygon_flat, &[], 2) {
-                    let start_v_idx = vertices.len() as u32;
-                    for pt in &perimeter_pts {
-                        vertices.push(WorldVertex { position: [pt.x, height, pt.z], normal: [0.0, 1.0, 0.0], color: building_color });
+                // Winding Check (Still good to have, though Culling: None makes it forgiving)
+                force_ccw(&mut raw_pts);
+
+                // Centroid & Inset
+                let mut center = glam::Vec2::ZERO;
+                for p in &raw_pts { center += *p; }
+                center /= raw_pts.len() as f32;
+
+                let mut final_pts = Vec::new();
+                let mut poly_flat = Vec::new();
+                for p in &raw_pts {
+                    let inset = center + (*p - center) * 0.90; 
+                    final_pts.push(glam::Vec3::new(inset.x, 0.0, inset.y));
+                    poly_flat.push(inset.x as f64);
+                    poly_flat.push(inset.y as f64);
+                }
+
+                // Chunking
+                let offset_x = center.x + (WORLD_SIZE / 2.0);
+                let offset_z = center.y + (WORLD_SIZE / 2.0);
+                let cx = (offset_x / CHUNK_SIZE).floor() as i32;
+                let cz = (offset_z / CHUNK_SIZE).floor() as i32;
+                
+                let chunk_idx = (cx.clamp(0, CHUNKS_AXIS - 1) + cz.clamp(0, CHUNKS_AXIS - 1) * CHUNKS_AXIS) as usize;
+                let (c_verts, c_inds) = &mut chunk_builders[chunk_idx];
+
+                // Roofs
+                if let Ok(tris) = earcut(&poly_flat, &[], 2) {
+                    let start = c_verts.len() as u32;
+                    for pt in &final_pts {
+                        c_verts.push(WorldVertex { 
+                            position: [pt.x, height, pt.z], 
+                            normal: [0.0, 1.0, 0.0], 
+                            color: building_color 
+                        });
                     }
-                    for &idx in &tris {
-                        indices.push(start_v_idx + (idx as u32));
+                    for idx in tris {
+                        c_inds.push(start + idx as u32);
                     }
                 }
 
-                for i in 0..perimeter_pts.len() - 1 {
-                    let p1 = perimeter_pts[i];
-                    let p2 = perimeter_pts[i+1];
+                // Walls
+                for i in 0..final_pts.len() - 1 {
+                    let p1 = final_pts[i];
+                    let p2 = final_pts[i+1];
+                    let base = c_verts.len() as u32;
 
                     let edge = p2 - p1;
-                    let normal = glam::Vec3::new(-edge.z, 0.0, edge.x).normalize().to_array(); 
-                    let base_idx = vertices.len() as u32;
-                    
-                    vertices.push(WorldVertex { position: [p1.x, 0.0,    p1.z], normal, color: building_color });
-                    vertices.push(WorldVertex { position: [p2.x, 0.0,    p2.z], normal, color: building_color });
-                    vertices.push(WorldVertex { position: [p2.x, height, p2.z], normal, color: building_color });
-                    vertices.push(WorldVertex { position: [p1.x, height, p1.z], normal, color: building_color });
+                    let normal = glam::Vec3::new(edge.z, 0.0, -edge.x).normalize().to_array();
 
-                    indices.push(base_idx + 0); indices.push(base_idx + 2); indices.push(base_idx + 1);
-                    indices.push(base_idx + 0); indices.push(base_idx + 3); indices.push(base_idx + 2);
+                    c_verts.push(WorldVertex { position: [p1.x, 0.0, p1.z], normal, color: building_color }); // 0
+                    c_verts.push(WorldVertex { position: [p2.x, 0.0, p2.z], normal, color: building_color }); // 1
+                    c_verts.push(WorldVertex { position: [p2.x, height, p2.z], normal, color: building_color }); // 2
+                    c_verts.push(WorldVertex { position: [p1.x, height, p1.z], normal, color: building_color }); // 3
 
-                    let thickness = 0.5;
-                    let min_x = p1.x.min(p2.x) - thickness;
-                    let max_x = p1.x.max(p2.x) + thickness;
-                    let min_z = p1.z.min(p2.z) - thickness;
-                    let max_z = p1.z.max(p2.z) + thickness;
+                    c_inds.push(base + 0); c_inds.push(base + 1); c_inds.push(base + 2);
+                    c_inds.push(base + 0); c_inds.push(base + 2); c_inds.push(base + 3);
 
+                    // Physics
                     let collider = WallCollider {
                         start: glam::Vec2::new(p1.x, p1.z),
                         end: glam::Vec2::new(p2.x, p2.z),
                         height,
-                        min_x, max_x, min_z, max_z
+                        min_x: p1.x.min(p2.x) - 0.5, max_x: p1.x.max(p2.x) + 0.5,
+                        min_z: p1.z.min(p2.z) - 0.5, max_z: p1.z.max(p2.z) + 0.5,
                     };
+                    let sgx = (collider.min_x / 50.0).floor() as i32;
+                    let egx = (collider.max_x / 50.0).floor() as i32;
+                    let sgz = (collider.min_z / 50.0).floor() as i32;
+                    let egz = (collider.max_z / 50.0).floor() as i32;
 
-                    let start_gx = (min_x / 50.0).floor() as i32;
-                    let end_gx = (max_x / 50.0).floor() as i32;
-                    let start_gz = (min_z / 50.0).floor() as i32;
-                    let end_gz = (max_z / 50.0).floor() as i32;
-
-                    for gx in start_gx..=end_gx {
-                        for gz in start_gz..=end_gz {
-                             collision_map.entry((gx, gz)).or_insert_with(Vec::new).push(collider.clone());
+                    for gx in sgx..=egx {
+                        for gz in sgz..=egz {
+                            collision_map.entry((gx, gz)).or_default().push(collider.clone());
                         }
                     }
                 }
             }
         }
-        
-        let ground_color = [0.05, 0.05, 0.05];
-        let sz = 20000.0; 
-        let v_start = vertices.len() as u32;
-        vertices.push(WorldVertex { position: [-sz, 0.0, -sz], normal: [0.0,1.0,0.0], color: ground_color });
-        vertices.push(WorldVertex { position: [ sz, 0.0, -sz], normal: [0.0,1.0,0.0], color: ground_color });
-        vertices.push(WorldVertex { position: [ sz, 0.0,  sz], normal: [0.0,1.0,0.0], color: ground_color });
-        vertices.push(WorldVertex { position: [-sz, 0.0,  sz], normal: [0.0,1.0,0.0], color: ground_color });
-        indices.push(v_start+0); indices.push(v_start+2); indices.push(v_start+1);
-        indices.push(v_start+0); indices.push(v_start+3); indices.push(v_start+2);
+
+        // Flatten
+        let mut master_vertices = Vec::new();
+        let mut master_indices = Vec::new();
+        let mut chunk_views = Vec::new();
+
+        // Ground
+        {
+            let sz = 20000.0; 
+            let g_col = [0.05, 0.05, 0.05]; // Dark ground
+            let base = master_vertices.len() as u32;
+            master_vertices.push(WorldVertex { position: [-sz,-0.1,-sz], normal:[0.0,1.0,0.0], color:g_col });
+            master_vertices.push(WorldVertex { position: [ sz,-0.1,-sz], normal:[0.0,1.0,0.0], color:g_col });
+            master_vertices.push(WorldVertex { position: [ sz,-0.1, sz], normal:[0.0,1.0,0.0], color:g_col });
+            master_vertices.push(WorldVertex { position: [-sz,-0.1, sz], normal:[0.0,1.0,0.0], color:g_col });
+            master_indices.push(base+0); master_indices.push(base+1); master_indices.push(base+2);
+            master_indices.push(base+0); master_indices.push(base+2); master_indices.push(base+3);
+            
+            chunk_views.push(ChunkView { 
+                index_start: 0, index_count: 6, 
+                min: glam::Vec2::splat(-sz), max: glam::Vec2::splat(sz) 
+            });
+        }
+
+        for (idx, (verts, inds)) in chunk_builders.into_iter().enumerate() {
+            if verts.is_empty() { continue; }
+            let v_offset = master_vertices.len() as u32;
+            let i_start = master_indices.len() as u32;
+            let i_count = inds.len() as u32;
+            master_vertices.extend(verts);
+            for i in inds { master_indices.push(i + v_offset); }
+            let cx = (idx as i32 % CHUNKS_AXIS) as f32 * CHUNK_SIZE - (WORLD_SIZE/2.0);
+            let cz = (idx as i32 / CHUNKS_AXIS) as f32 * CHUNK_SIZE - (WORLD_SIZE/2.0);
+            chunk_views.push(ChunkView {
+                index_start: i_start,
+                index_count: i_count,
+                min: glam::Vec2::new(cx, cz),
+                max: glam::Vec2::new(cx + CHUNK_SIZE, cz + CHUNK_SIZE),
+            });
+        }
 
         let _ = tx.send(LoaderMessage::Progress(1.0));
-        
-        Self { vertices, indices, collision_map }
+        Self { vertices: master_vertices, indices: master_indices, chunks: chunk_views, collision_map }
     }
+}
+
+fn force_ccw(pts: &mut Vec<glam::Vec2>) {
+    let mut sum = 0.0;
+    for i in 0..pts.len() {
+        let p1 = pts[i];
+        let p2 = pts[(i + 1) % pts.len()];
+        sum += (p2.x - p1.x) * (p2.y + p1.y);
+    }
+    if sum > 0.0 { pts.reverse(); }
 }
