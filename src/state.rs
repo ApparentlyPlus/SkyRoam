@@ -169,8 +169,7 @@ impl GameState {
                 module: &shader_module, entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState { format: ctx.config.format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })],
             }),
-            // FIX: DISABLE CULLING TO FIX MISSING FACES
-            // Inconsistent OSM winding data requires this.
+            // FIX: Keep Cull Mode NONE as requested
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
             depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::Less, stencil: wgpu::StencilState::default(), bias: wgpu::DepthBiasState::default() }),
             multisample: wgpu::MultisampleState { count: 4, mask: !0, alpha_to_coverage_enabled: false },
@@ -301,35 +300,34 @@ impl GameState {
         
         self.velocity.x = input_dir.x * move_speed;
         self.velocity.z = input_dir.z * move_speed;
-        
         self.velocity.y -= gravity * dt;
 
         if self.on_ground && self.camera_controller.jump {
             self.velocity.y = jump_force;
             self.on_ground = false;
         }
-
-        let mut next_pos = self.camera.eye;
-        let mut dx = self.velocity.x * dt;
-        let test_x = next_pos + glam::DVec3::new(dx, 0.0, 0.0);
-        if let Some(normal) = self.check_collision(test_x) {
-            let dot = self.velocity.dot(normal);
-            if dot < 0.0 { self.velocity -= normal * dot; }
-            dx = self.velocity.x * dt;
+        
+        // Predict full movement
+        let mut next_pos = self.camera.eye + self.velocity * dt;
+        
+        // Resolve Overlaps
+        for _ in 0..4 {
+            if let Some(normal) = self.check_collision(next_pos) {
+                // Remove velocity component into the wall (slide)
+                let dot = self.velocity.dot(normal);
+                if dot < 0.0 {
+                    self.velocity -= normal * dot;
+                }
+                
+                // Push position out of the wall significantly to prevent re-entry
+                // The 0.005 push ensures we clear the "skin width" of the collider
+                next_pos += normal * 0.005; 
+            } else {
+                break; // No collision, safe to proceed
+            }
         }
-        next_pos.x += dx; 
 
-        let mut dz = self.velocity.z * dt;
-        let test_z = next_pos + glam::DVec3::new(0.0, 0.0, dz);
-        if let Some(normal) = self.check_collision(test_z) {
-            let dot = self.velocity.dot(normal);
-            if dot < 0.0 { self.velocity -= normal * dot; }
-            dz = self.velocity.z * dt;
-        }
-        next_pos.z += dz; 
-
-        next_pos.y += self.velocity.y * dt;
-
+        // Apply Floor Constraint
         if next_pos.y < 1.8 {
             next_pos.y = 1.8;
             self.velocity.y = 0.0;
@@ -372,7 +370,7 @@ impl GameState {
 
             let cam_x = self.camera.eye.x as f32;
             let cam_z = self.camera.eye.z as f32;
-            let draw_dist = 3000.0f32; // FIXED: Explicit f32
+            let draw_dist = 3000.0f32; 
 
             for chunk in &self.world.chunks {
                 let cx = (chunk.min.x + chunk.max.x) * 0.5;
