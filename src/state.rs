@@ -311,6 +311,7 @@ impl GameState {
         if self.on_ground && self.camera_controller.jump {
             self.velocity.y = jump_force;
             self.on_ground = false;
+            self.camera_controller.jump = false;
         }
 
         let mut remaining_dt = dt;
