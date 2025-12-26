@@ -67,13 +67,7 @@ impl CameraController {
                     KeyCode::KeyS => { self.move_back = pressed; true }
                     KeyCode::KeyA => { self.move_left = pressed; true }
                     KeyCode::KeyD => { self.move_right = pressed; true }
-                    
-                    KeyCode::Space => { 
-                        if pressed {
-                            self.jump = true; 
-                        }
-                        true 
-                    }
+                    KeyCode::Space => { self.jump = pressed; true }
                     _ => false,
                 }
             }
