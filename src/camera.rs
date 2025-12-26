@@ -75,3 +75,108 @@ impl CameraController {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct Plane {
+    pub normal: glam::Vec3,
+    pub distance: f32,
+}
+
+impl Plane {
+    pub fn new(x: f32, y: f32, z: f32, w: f32) -> Self {
+        let normal = glam::Vec3::new(x, y, z);
+        let length = normal.length();
+        // Normalize the plane equation so distance checks are in meters
+        Self {
+            normal: normal / length,
+            distance: w / length,
+        }
+    }
+
+    /// Returns signed distance from plane to point. Positive = inside/front, Negative = outside/back.
+    pub fn distance_to_point(&self, point: glam::Vec3) -> f32 {
+        self.normal.dot(point) + self.distance
+    }
+}
+
+pub struct Frustum {
+    pub planes: [Plane; 6],
+}
+
+impl Frustum {
+    /// Extracts frustum planes from a View-Projection matrix.
+    /// This works for the standard glam::perspective_rh depth range (-1 to 1).
+    pub fn from_mat4(m: glam::Mat4) -> Self {
+        // Extract rows for clearer access (Gribb-Hartmann extraction)
+        let row0 = m.row(0);
+        let row1 = m.row(1);
+        let row2 = m.row(2);
+        let row3 = m.row(3);
+
+        let planes = [
+            // Left
+            Plane::new(
+                row3.x + row0.x,
+                row3.y + row0.y,
+                row3.z + row0.z,
+                row3.w + row0.w,
+            ),
+            // Right
+            Plane::new(
+                row3.x - row0.x,
+                row3.y - row0.y,
+                row3.z - row0.z,
+                row3.w - row0.w,
+            ),
+            // Bottom
+            Plane::new(
+                row3.x + row1.x,
+                row3.y + row1.y,
+                row3.z + row1.z,
+                row3.w + row1.w,
+            ),
+            // Top
+            Plane::new(
+                row3.x - row1.x,
+                row3.y - row1.y,
+                row3.z - row1.z,
+                row3.w - row1.w,
+            ),
+            // Near (Z > -1)
+            Plane::new(
+                row3.x + row2.x,
+                row3.y + row2.y,
+                row3.z + row2.z,
+                row3.w + row2.w,
+            ),
+            // Far (Z < 1)
+            Plane::new(
+                row3.x - row2.x,
+                row3.y - row2.y,
+                row3.z - row2.z,
+                row3.w - row2.w,
+            ),
+        ];
+
+        Self { planes }
+    }
+
+    /// Checks if an AABB (Axis Aligned Bounding Box) is inside the frustum.
+    /// Uses the "Positive Vertex" optimization for fast rejection.
+    pub fn intersects_aabb(&self, min: &glam::Vec3, max: &glam::Vec3) -> bool {
+        for plane in &self.planes {
+            // Find the "positive vertex" (the corner most aligned with the normal)
+            let p_vertex = glam::Vec3::new(
+                if plane.normal.x >= 0.0 { max.x } else { min.x },
+                if plane.normal.y >= 0.0 { max.y } else { min.y },
+                if plane.normal.z >= 0.0 { max.z } else { min.z },
+            );
+
+            // If the "positive" corner is behind the plane, the whole box is outside
+            if plane.distance_to_point(p_vertex) < 0.0 {
+                return false;
+            }
+        }
+        true
+    }
+}

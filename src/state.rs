@@ -1,7 +1,7 @@
 use winit::{window::Window, event::*};
 use wgpu::util::DeviceExt;
 use std::time::Instant;
-use crate::{camera::{Camera, CameraUniform, CameraController}, world::*, shader};
+use crate::{camera::{Camera, CameraUniform, CameraController, Frustum}, world::*, shader};
 
 pub struct GpuContext {
     pub surface: wgpu::Surface<'static>,
@@ -364,7 +364,8 @@ impl GameState {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.ctx.msaa_texture, resolve_target: Some(&view),
+                    view: &self.ctx.msaa_texture,
+                    resolve_target: Some(&view),
                     ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -379,21 +380,42 @@ impl GameState {
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            
+            // Calculate View-Projection Matrix once per frame
+            let view_proj = self.camera.build_view_projection_matrix();
+            
+            // Build Frustum planes from matrix
+            let frustum = Frustum::from_mat4(view_proj);
 
             let cam_x = self.camera.eye.x as f32;
             let cam_z = self.camera.eye.z as f32;
             let draw_dist = 3000.0f32; 
+            let draw_dist_sq = draw_dist * draw_dist;
+
+            // Define vertical bounds for chunks (Ground to max building height)
+            let chunk_min_y = -20.0;
+            let chunk_max_y = 300.0; // Higher than tallest buildings
 
             for chunk in &self.world.chunks {
                 let cx = (chunk.min.x + chunk.max.x) * 0.5;
                 let cz = (chunk.min.y + chunk.max.y) * 0.5; 
                 
+                // Fast radial distance check
+                // This keeps the "circle" of loaded world valid for fog
                 let dist_sq = (cx - cam_x).powi(2) + (cz - cam_z).powi(2);
-                if dist_sq < draw_dist * draw_dist {
-                    render_pass.draw_indexed(
-                        chunk.index_start..(chunk.index_start + chunk.index_count),
-                        0, 0..1
-                    );
+                
+                if dist_sq < draw_dist_sq {
+                    // 3. Precise Frustum Check
+                    // Convert the 2D chunk bounds into a 3D AABB
+                    let chunk_aabb_min = glam::Vec3::new(chunk.min.x, chunk_min_y, chunk.min.y);
+                    let chunk_aabb_max = glam::Vec3::new(chunk.max.x, chunk_max_y, chunk.max.y);
+
+                    if frustum.intersects_aabb(&chunk_aabb_min, &chunk_aabb_max) {
+                        render_pass.draw_indexed(
+                            chunk.index_start..(chunk.index_start + chunk.index_count),
+                            0, 0..1
+                        );
+                    }
                 }
             }
 
