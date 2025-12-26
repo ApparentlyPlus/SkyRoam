@@ -1,3 +1,4 @@
+// main.rs
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
@@ -9,17 +10,19 @@ use std::time::Instant;
 use std::sync::mpsc;
 use std::thread;
 
+mod config;
 mod shader;
 mod vertex;
 mod camera;
 mod world;
 mod state;
+
 use state::{GameState, GpuContext};
 use world::{World, LoaderMessage};
 
-// --- LOADING SCREEN RENDERER ---
+// Loading Screen (Simple Rendering)
 #[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct LoadingUniforms {
     screen_size: [f32; 2],
     progress: f32,
@@ -36,67 +39,38 @@ struct LoadingScreen {
 impl LoadingScreen {
     fn new(ctx: &GpuContext) -> Self {
         let shader = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Loading Shader"),
-            source: wgpu::ShaderSource::Wgsl(shader::LOADING_SHADER.into()),
+            label: Some("Loading Shader"), source: wgpu::ShaderSource::Wgsl(shader::LOADING_SHADER.into()),
         });
         
-        // Create Uniform Buffer
-        let uniforms = LoadingUniforms {
-            screen_size: [ctx.config.width as f32, ctx.config.height as f32],
-            progress: 0.0,
-            _pad: 0.0,
-        };
+        let uniforms = LoadingUniforms { screen_size: [ctx.config.width as f32, ctx.config.height as f32], progress: 0.0, _pad: 0.0 };
         let uniform_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Loading Uniforms"),
-            contents: bytemuck::cast_slice(&[uniforms]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            label: Some("Loading Uniforms"), contents: bytemuck::cast_slice(&[uniforms]), usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         let bind_group_layout = ctx.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer { 
-                    ty: wgpu::BufferBindingType::Uniform, 
-                    has_dynamic_offset: false, 
-                    min_binding_size: None 
-                },
-                count: None,
-            }],
-            label: Some("Loading Bind Group Layout"),
+                binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+            }], label: None,
         });
 
         let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-            label: Some("Loading Bind Group"),
+            layout: &bind_group_layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() }], label: None,
         });
 
         let pipeline_layout = ctx.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Loading Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            label: None, bind_group_layouts: &[&bind_group_layout], push_constant_ranges: &[],
         });
 
         let pipeline = ctx.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Loading Pipeline"),
-            layout: Some(&pipeline_layout),
+            label: Some("Loading Pipeline"), layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: "vs_main", buffers: &[] },
             fragment: Some(wgpu::FragmentState {
                 module: &shader, entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: ctx.config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &[Some(wgpu::ColorTargetState { format: ctx.config.format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })],
             }),
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None,
         });
 
         Self { pipeline, uniform_buffer, bind_group, current_progress: 0.0 }
@@ -105,9 +79,8 @@ impl LoadingScreen {
     fn render(&self, ctx: &mut GpuContext) {
         let Ok(output) = ctx.surface.get_current_texture() else { return };
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-        // Update Uniforms (Progress + Screen Size in case of resize)
         let uniforms = LoadingUniforms {
             screen_size: [ctx.config.width as f32, ctx.config.height as f32],
             progress: self.current_progress,
@@ -122,13 +95,11 @@ impl LoadingScreen {
                     view: &view, resolve_target: None,
                     ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
                 })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None, occlusion_query_set: None,
+                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
             });
-            
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.draw(0..4, 0..1); // Draw Quad (Vertex index handles geometry)
+            pass.draw(0..4, 0..1);
         }
         
         ctx.queue.submit(std::iter::once(encoder.finish()));
@@ -138,9 +109,7 @@ impl LoadingScreen {
 
 fn set_cursor_grab(window: &Window, grabbed: bool) {
     if grabbed {
-        if window.set_cursor_grab(CursorGrabMode::Confined).is_err() {
-            let _ = window.set_cursor_grab(CursorGrabMode::Locked);
-        }
+        let _ = window.set_cursor_grab(CursorGrabMode::Confined).or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked));
         window.set_cursor_visible(false);
     } else {
         let _ = window.set_cursor_grab(CursorGrabMode::None);
@@ -153,13 +122,15 @@ fn main() {
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
     
-    let builder = WindowBuilder::new().with_title("Blazing Mapbox");
+    let builder = WindowBuilder::new().with_title(config::WINDOW_TITLE);
     let monitor = event_loop.primary_monitor();
     let window = std::sync::Arc::new(builder.with_fullscreen(Some(Fullscreen::Borderless(monitor))).build(&event_loop).unwrap());
     
-    let mut gpu_ctx_opt = Some(pollster::block_on(GpuContext::new(window.clone())));
-    let mut loading_screen = LoadingScreen::new(gpu_ctx_opt.as_ref().unwrap());
+    // Initialize GPU context immediately for loading screen
+    let mut gpu_ctx = Some(pollster::block_on(GpuContext::new(window.clone())));
+    let mut loading_screen = LoadingScreen::new(gpu_ctx.as_ref().unwrap());
 
+    // Threaded World Generation
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let world = World::generate(tx.clone());
@@ -176,6 +147,7 @@ fn main() {
         match event {
             Event::WindowEvent { ref event, window_id } if window_id == window.id() => {
                 if let Some(s) = &mut state {
+                    // Game Input
                     if !s.input(event) {
                         match event {
                             WindowEvent::CloseRequested => elwt.exit(),
@@ -186,7 +158,7 @@ fn main() {
                                     Ok(_) => {}
                                     Err(wgpu::SurfaceError::Lost) => s.resize(s.ctx.size),
                                     Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
-                                    Err(e) => eprintln!("Render error: {:?}", e),
+                                    Err(e) => eprintln!("Render Error: {:?}", e),
                                 }
                             }
                             WindowEvent::MouseInput { state: element_state, button: MouseButton::Left, .. } => {
@@ -205,29 +177,21 @@ fn main() {
                         }
                     }
                 } else {
+                    // Loading State Input
                     match event {
                         WindowEvent::CloseRequested => elwt.exit(),
-                        WindowEvent::Resized(size) => {
-                            if let Some(ctx) = &mut gpu_ctx_opt {
-                                ctx.resize(*size);
-                            }
-                        }
-                        WindowEvent::RedrawRequested => {
-                            if let Some(ctx) = &mut gpu_ctx_opt {
-                                loading_screen.render(ctx);
-                            }
-                        },
+                        WindowEvent::Resized(size) => { if let Some(ctx) = &mut gpu_ctx { ctx.resize(*size); } }
+                        WindowEvent::RedrawRequested => { if let Some(ctx) = &mut gpu_ctx { loading_screen.render(ctx); } },
                         _ => {}
                     }
                 }
             },
             Event::DeviceEvent { event: DeviceEvent::MouseMotion { delta }, .. } => {
-                if let Some(s) = &mut state {
-                    s.update_camera_rotation(delta);
-                }
+                if let Some(s) = &mut state { s.update_camera_rotation(delta); }
             },
             Event::AboutToWait => {
                 if state.is_none() {
+                    // Check Loader Thread
                     let mut updated = false;
                     while let Ok(msg) = rx.try_recv() {
                         match msg {
@@ -237,7 +201,7 @@ fn main() {
                             },
                             LoaderMessage::Done(world) => {
                                 loading_screen.current_progress = 1.0;
-                                if let Some(mut ctx) = gpu_ctx_opt.take() {
+                                if let Some(mut ctx) = gpu_ctx.take() {
                                     loading_screen.render(&mut ctx);
                                     state = Some(GameState::new(ctx, world));
                                 }
@@ -247,9 +211,10 @@ fn main() {
                     }
                     if updated { window.request_redraw(); }
                 } else {
+                    // FPS Counter & Redraw Request
                     frames += 1;
                     if last_fps_print.elapsed().as_secs_f32() >= 1.0 {
-                        window.set_title(&format!("Blazing Mapbox | FPS: {}", frames));
+                        window.set_title(&format!("{} | FPS: {}", config::WINDOW_TITLE, frames));
                         frames = 0;
                         last_fps_print = Instant::now();
                     }

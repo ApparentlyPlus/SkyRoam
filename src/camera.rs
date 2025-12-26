@@ -1,35 +1,49 @@
+// camera.rs
+use glam::{DMat4, DVec3, Mat4, Vec3};
 use winit::event::*;
 use winit::keyboard::{KeyCode, PhysicalKey};
+use crate::config;
 
-// Use DVec3 (f64) for position to prevent jitter at large world coordinates
+#[derive(Debug)]
 pub struct Camera {
-    pub eye: glam::DVec3,
-    pub velocity: glam::DVec3,
+    pub eye: DVec3,
     pub yaw: f32,
     pub pitch: f32,
     pub aspect: f32,
 }
 
 impl Camera {
-    pub fn build_view_projection_matrix(&self) -> glam::Mat4 {
+    pub fn new(aspect: f32) -> Self {
+        Self {
+            eye: DVec3::new(0.0, 50.0, 0.0),
+            yaw: -90.0f32.to_radians(),
+            pitch: 0.0,
+            aspect,
+        }
+    }
+
+    pub fn build_view_projection_matrix(&self) -> Mat4 {
         let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
         let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
 
-        // Calculate target in f64 then downcast for the matrix creation if needed, 
-        // or keep high precision for the LookAt calculation.
-        let target = glam::DVec3::new(
-            (cos_pitch * cos_yaw) as f64, 
-            sin_pitch as f64, 
-            (cos_pitch * sin_yaw) as f64
+        // Calculate target direction
+        let target = DVec3::new(
+            (cos_pitch * cos_yaw) as f64,
+            sin_pitch as f64,
+            (cos_pitch * sin_yaw) as f64,
         ).normalize();
 
-        // We calculate the View Matrix in f64 first
-        let view = glam::DMat4::look_at_rh(self.eye, self.eye + target, glam::DVec3::Y);
+        // View Matrix (High Precision)
+        let view = DMat4::look_at_rh(self.eye, self.eye + target, DVec3::Y);
         
-        // Perspective is usually fine in f32
-        let proj = glam::Mat4::perspective_rh(45.0f32.to_radians(), self.aspect, 0.1, 10000.0);
+        // Projection Matrix (Standard f32 is sufficient)
+        let proj = Mat4::perspective_rh(
+            config::FOV_Y.to_radians(),
+            self.aspect,
+            config::Z_NEAR,
+            config::Z_FAR,
+        );
 
-        // Convert View to f32 and multiply
         proj * view.as_mat4()
     }
 }
@@ -37,10 +51,10 @@ impl Camera {
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CameraUniform {
-    pub view_proj: [[f32; 4]; 4], 
-    pub screen_size: [f32; 2],    
-    pub fog_dist: [f32; 2], 
-    pub camera_pos: [f32; 4],      
+    pub view_proj: [[f32; 4]; 4],
+    pub screen_size: [f32; 2],
+    pub fog_dist: [f32; 2],
+    pub camera_pos: [f32; 4],
 }
 
 pub struct CameraController {
@@ -76,103 +90,59 @@ impl CameraController {
     }
 }
 
+// Frustum Culling
+
 #[derive(Debug, Clone, Copy)]
-pub struct Plane {
-    pub normal: glam::Vec3,
-    pub distance: f32,
+struct Plane {
+    normal: Vec3,
+    distance: f32,
 }
 
 impl Plane {
-    pub fn new(x: f32, y: f32, z: f32, w: f32) -> Self {
-        let normal = glam::Vec3::new(x, y, z);
-        let length = normal.length();
-        // Normalize the plane equation so distance checks are in meters
+    fn new(x: f32, y: f32, z: f32, w: f32) -> Self {
+        let normal = Vec3::new(x, y, z);
+        let length_inv = 1.0 / normal.length();
         Self {
-            normal: normal / length,
-            distance: w / length,
+            normal: normal * length_inv,
+            distance: w * length_inv,
         }
     }
 
-    /// Returns signed distance from plane to point. Positive = inside/front, Negative = outside/back.
-    pub fn distance_to_point(&self, point: glam::Vec3) -> f32 {
+    fn distance_to_point(&self, point: Vec3) -> f32 {
         self.normal.dot(point) + self.distance
     }
 }
 
 pub struct Frustum {
-    pub planes: [Plane; 6],
+    planes: [Plane; 6],
 }
 
 impl Frustum {
-    /// Extracts frustum planes from a View-Projection matrix.
-    /// This works for the standard glam::perspective_rh depth range (-1 to 1).
-    pub fn from_mat4(m: glam::Mat4) -> Self {
-        // Extract rows for clearer access (Gribb-Hartmann extraction)
+    pub fn from_mat4(m: Mat4) -> Self {
         let row0 = m.row(0);
         let row1 = m.row(1);
         let row2 = m.row(2);
         let row3 = m.row(3);
 
-        let planes = [
-            // Left
-            Plane::new(
-                row3.x + row0.x,
-                row3.y + row0.y,
-                row3.z + row0.z,
-                row3.w + row0.w,
-            ),
-            // Right
-            Plane::new(
-                row3.x - row0.x,
-                row3.y - row0.y,
-                row3.z - row0.z,
-                row3.w - row0.w,
-            ),
-            // Bottom
-            Plane::new(
-                row3.x + row1.x,
-                row3.y + row1.y,
-                row3.z + row1.z,
-                row3.w + row1.w,
-            ),
-            // Top
-            Plane::new(
-                row3.x - row1.x,
-                row3.y - row1.y,
-                row3.z - row1.z,
-                row3.w - row1.w,
-            ),
-            // Near (Z > -1)
-            Plane::new(
-                row3.x + row2.x,
-                row3.y + row2.y,
-                row3.z + row2.z,
-                row3.w + row2.w,
-            ),
-            // Far (Z < 1)
-            Plane::new(
-                row3.x - row2.x,
-                row3.y - row2.y,
-                row3.z - row2.z,
-                row3.w - row2.w,
-            ),
-        ];
-
-        Self { planes }
+        Self {
+            planes: [
+                Plane::new(row3.x + row0.x, row3.y + row0.y, row3.z + row0.z, row3.w + row0.w), // Left
+                Plane::new(row3.x - row0.x, row3.y - row0.y, row3.z - row0.z, row3.w - row0.w), // Right
+                Plane::new(row3.x + row1.x, row3.y + row1.y, row3.z + row1.z, row3.w + row1.w), // Bottom
+                Plane::new(row3.x - row1.x, row3.y - row1.y, row3.z - row1.z, row3.w - row1.w), // Top
+                Plane::new(row3.x + row2.x, row3.y + row2.y, row3.z + row2.z, row3.w + row2.w), // Near
+                Plane::new(row3.x - row2.x, row3.y - row2.y, row3.z - row2.z, row3.w - row2.w), // Far
+            ]
+        }
     }
 
-    /// Checks if an AABB (Axis Aligned Bounding Box) is inside the frustum.
-    /// Uses the "Positive Vertex" optimization for fast rejection.
-    pub fn intersects_aabb(&self, min: &glam::Vec3, max: &glam::Vec3) -> bool {
+    pub fn intersects_aabb(&self, min: &Vec3, max: &Vec3) -> bool {
         for plane in &self.planes {
-            // Find the "positive vertex" (the corner most aligned with the normal)
-            let p_vertex = glam::Vec3::new(
+            let p_vertex = Vec3::new(
                 if plane.normal.x >= 0.0 { max.x } else { min.x },
                 if plane.normal.y >= 0.0 { max.y } else { min.y },
                 if plane.normal.z >= 0.0 { max.z } else { min.z },
             );
-
-            // If the "positive" corner is behind the plane, the whole box is outside
             if plane.distance_to_point(p_vertex) < 0.0 {
                 return false;
             }
