@@ -17,7 +17,6 @@ pub const CHUNK_SIZE: f32 = WORLD_SIZE / CHUNKS_AXIS as f32;
 pub const PHYSICS_GRID_CELL_SIZE: f32 = 50.0;
 pub const PLAYER_RADIUS: f64 = 0.3;
 pub const WALL_THICKNESS: f64 = 0.5; // Visual thickness of walls
-pub const MAX_SLOPE_ANGLE: f32 = 45.0;
 
 // Movement
 pub const MOVE_SPEED: f64 = 15.0;
@@ -31,9 +30,9 @@ pub const MAX_PHYSICS_STEPS: i32 = 5;
 pub const FOV_Y: f32 = 45.0;
 pub const Z_NEAR: f32 = 0.1;
 pub const Z_FAR: f32 = 10000.0;
-pub const DRAW_DISTANCE: f32 = 3000.0;
-pub const FOG_START: f32 = 100.0;
-pub const FOG_END: f32 = 3000.0;
+pub const DRAW_DISTANCE: f32 = 3500.0;
+pub const FOG_START: f32 = 1000.0;
+pub const FOG_END: f32 = 2500.0;       // Reduced so world fades out BEFORE it cuts off
 
 // Chunk culling vertical bounds
 pub const CHUNK_MIN_Y: f32 = -20.0;
