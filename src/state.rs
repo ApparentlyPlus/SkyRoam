@@ -37,6 +37,7 @@ impl GpuContext {
         
         let mut final_config = config.clone();
         let caps = surface.get_capabilities(&adapter);
+        // Mailbox is crucial for Linux/Wayland latency, Fifo as fallback
         if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
             final_config.present_mode = wgpu::PresentMode::Mailbox;
         } else {
@@ -169,7 +170,7 @@ impl GameState {
                 module: &shader_module, entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState { format: ctx.config.format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })],
             }),
-            // FIX: Keep Cull Mode NONE as requested
+            // Keep Cull Mode NONE as requested
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
             depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::Less, stencil: wgpu::StencilState::default(), bias: wgpu::DepthBiasState::default() }),
             multisample: wgpu::MultisampleState { count: 4, mask: !0, alpha_to_coverage_enabled: false },
@@ -279,6 +280,7 @@ impl GameState {
 
     pub fn update(&mut self) {
         let now = Instant::now();
+        // Clamping dt to 0.1 prevents HUGE jumps, but it's not enough for low FPS tunneling.
         let dt = now.duration_since(self.last_frame_time).as_secs_f64().clamp(0.0001, 0.1);
         self.last_frame_time = now;
 
@@ -307,36 +309,42 @@ impl GameState {
             self.on_ground = false;
         }
         
-        // Predict full movement
-        let mut next_pos = self.camera.eye + self.velocity * dt;
-        
-        // Resolve Overlaps
-        for _ in 0..4 {
-            if let Some(normal) = self.check_collision(next_pos) {
-                // Remove velocity component into the wall (slide)
-                let dot = self.velocity.dot(normal);
-                if dot < 0.0 {
-                    self.velocity -= normal * dot;
+        let mut remaining_dt = dt;
+        let step_size = 0.02; // 50 Hz physics minimum
+
+        while remaining_dt > 0.0 {
+            let step = remaining_dt.min(step_size);
+            
+            // Predict Movement
+            let mut next_pos = self.camera.eye + self.velocity * step;
+            
+            // Resolve Collisions (Iterative "Collide & Slide")
+            for _ in 0..4 {
+                if let Some(normal) = self.check_collision(next_pos) {
+                    let dot = self.velocity.dot(normal);
+                    if dot < 0.0 {
+                        self.velocity -= normal * dot;
+                    }
+                    
+                    // Push out slightly to prevent getting stuck in walls
+                    next_pos += normal * 0.005; 
+                } else {
+                    break;
                 }
-                
-                // Push position out of the wall significantly to prevent re-entry
-                // The 0.005 push ensures we clear the "skin width" of the collider
-                next_pos += normal * 0.005; 
-            } else {
-                break; // No collision, safe to proceed
             }
-        }
 
-        // Apply Floor Constraint
-        if next_pos.y < 1.8 {
-            next_pos.y = 1.8;
-            self.velocity.y = 0.0;
-            self.on_ground = true;
-        } else {
-            self.on_ground = false;
-        }
+            // Floor
+            if next_pos.y < 1.8 {
+                next_pos.y = 1.8;
+                self.velocity.y = 0.0;
+                self.on_ground = true;
+            } else {
+                self.on_ground = false;
+            }
 
-        self.camera.eye = next_pos;
+            self.camera.eye = next_pos;
+            remaining_dt -= step;
+        }
 
         self.camera_uniform.view_proj = self.camera.build_view_projection_matrix().to_cols_array_2d();
         self.camera_uniform.camera_pos = [self.camera.eye.x as f32, self.camera.eye.y as f32, self.camera.eye.z as f32, 0.0];
